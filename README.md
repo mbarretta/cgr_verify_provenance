@@ -38,7 +38,7 @@ Verifies images were signed and delivered by Chainguard. No access to `chainguar
 
 This verifies:
 1. Image has a valid signature from Chainguard
-2. Signature is recorded in Rekor transparency log
+2. Delivery signature is recorded in Rekor transparency log
 3. Extracts the claimed base digest for cross-customer comparison
 
 ### Full Verification
@@ -53,7 +53,7 @@ Additionally verifies:
 
 4. Base digest exists in reference org
 5. Base image has valid build signature from Chainguard's GitHub workflow
-6. Build signature is recorded in Rekor
+6. Base image build signature is recorded in Rekor
 
 ### Options
 
