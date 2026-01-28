@@ -6,7 +6,7 @@ Verify that container images delivered to your organization were authentically b
 
 | Question | How It's Verified |
 |----------|-------------------|
-| **Is my image from Chainguard?** | Signature OIDC issuer is `issuer.enforce.dev` (Chainguard Enforce) |
+| **Is my image from Chainguard?** | Signature OIDC issuer is `issuer.enforce.dev` (Chainguard) |
 | **Is it the same as the base image?** | `base_digest` label matches image in `chainguard-private` reference org |
 | **Has it been tampered with?** | Signed digest in payload matches actual image digest |
 | **Is the signature forged/backdated?** | Signature recorded in immutable Rekor transparency log with timestamp |
@@ -37,7 +37,7 @@ Verifies images were signed and delivered by Chainguard. No access to `chainguar
 ```
 
 This verifies:
-1. Image has a valid signature from Chainguard Enforce
+1. Image has a valid signature from Chainguard
 2. Signature is recorded in Rekor transparency log
 3. Extracts the claimed base digest for cross-customer comparison
 
@@ -109,7 +109,7 @@ Results are saved to `{customer-org}.csv` with columns:
 
 | Status | Meaning |
 |--------|---------|
-| `DELIVERY_VERIFIED` | Signed by Chainguard Enforce + recorded in Rekor |
+| `DELIVERY_VERIFIED` | Signed by Chainguard + recorded in Rekor |
 | `VERIFIED` | Base image exists in reference org + signed + in Rekor (full mode) |
 | `PARTIAL` | Signature found but no Rekor entry |
 | `NOT_FOUND` | Base digest not in reference org (full mode only) |
