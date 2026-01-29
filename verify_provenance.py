@@ -720,8 +720,9 @@ Examples:
 
     # Header
     mode_desc = "DELIVERY VERIFICATION" if customer_only else "FULL VERIFICATION"
+    title = f"Chainguard Image   {mode_desc}"
     print("╔══════════════════════════════════════════════════════════════════════════════╗")
-    print(f"║  Chainguard Image {mode_desc:^40}     ║")
+    print(f"║{title:^78}║")
     print("╠══════════════════════════════════════════════════════════════════════════════╣")
     print(f"║  Customer Org:     {args.customer_org:<58}║")
     if not customer_only:
