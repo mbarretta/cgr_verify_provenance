@@ -669,7 +669,8 @@ Examples:
     parser.add_argument(
         "--full", action="store_true",
         help="Full verification mode: also verify base digest exists in "
-             "chainguard-private and was signed by Chainguard's build system"
+             "chainguard-private and was signed by Chainguard's build system "
+             "(implies --verify-signatures)"
     )
     parser.add_argument(
         "--verify-signatures", action="store_true",
@@ -684,6 +685,10 @@ Examples:
         help="Show version and dependency information"
     )
     args = parser.parse_args()
+
+    # --full implies --verify-signatures
+    if args.full:
+        args.verify_signatures = True
 
     # Handle --version flag
     if args.version:

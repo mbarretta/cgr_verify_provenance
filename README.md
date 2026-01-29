@@ -59,7 +59,7 @@ Additionally verifies:
 
 ```
 --customer-org ORG    Customer organization to verify (required)
---full                Enable full verification mode
+--full                Enable full verification mode (implies --verify-signatures)
 --verify-signatures   Enable cryptographic signature verification
 --limit N             Limit number of images to check
 ```
