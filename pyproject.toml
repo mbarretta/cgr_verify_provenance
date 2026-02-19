@@ -1,6 +1,6 @@
 [project]
 name = "verify-provenance"
-version = "0.1.0"
+version = "0.2.0"
 description = "Verify Chainguard image provenance and delivery authenticity"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -10,8 +10,14 @@ authors = [
 ]
 keywords = ["chainguard", "sigstore", "cosign", "provenance", "supply-chain"]
 
+[project.optional-dependencies]
+forge = ["forge-core"]
+
 [project.scripts]
 verify-provenance = "verify_provenance:main"
+
+[project.entry-points."forge.plugins"]
+provenance = "forge_plugin:create_plugin"
 
 [project.urls]
 Homepage = "https://github.com/mbarretta/verify-provenance"
