@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "Example policy file for --policy-file. All fields are optional;",
+    "omitted fields inherit defaults. Two stanzas:",
+    "  'customer' — customer-org delivery signatures (Chainguard Enforce)",
+    "  'build'    — reference-org base-image build signatures (GitHub Actions)",
+    "The _comment key is ignored. Remove this block if a strict validator",
+    "doesn't tolerate it — the loader rejects any other unknown field."
+  ],
+
+  "customer": {
+    "cosign_oidc_issuer_regex": "^https://issuer\\.enforce\\.dev.*$",
+    "cosign_identity_regex": ".*",
+    "allowed_builder_ids": [
+      "^https?://issuer\\.enforce\\.dev/.*$"
+    ],
+    "allowed_source_uris": [
+      "^git\\+?https://github\\.com/chainguard-images/.*$",
+      "^https://github\\.com/chainguard-images/.*$"
+    ]
+  },
+
+  "build": {
+    "cosign_oidc_issuer_regex": "^https://token\\.actions\\.githubusercontent\\.com.*$",
+    "cosign_identity_regex": ".*chainguard.*",
+    "allowed_builder_ids": [
+      "^https://token\\.actions\\.githubusercontent\\.com/chainguard-images/images/\\.github/workflows/.*$"
+    ],
+    "allowed_source_uris": [
+      "^git\\+?https://github\\.com/chainguard-images/.*$"
+    ]
+  }
+}

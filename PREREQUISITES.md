@@ -51,7 +51,64 @@ brew install cosign
 
 **Documentation:** https://docs.sigstore.dev/cosign/overview/
 
-### 4. rekor-cli (Optional)
+### 4. curl
+
+Used by the `library` subcommand to fetch artifacts and Sigstore bundles from `libraries.cgr.dev`.
+
+**Installation:**
+```bash
+# Almost always pre-installed on Linux/macOS. If missing:
+# macOS: brew install curl
+# Debian/Ubuntu: apt-get install curl
+# RHEL/Fedora: yum install curl
+```
+
+### 5. openssl (Optional, for library mode)
+
+Used by the `library` subcommand to extract the signer identity (SAN URI) from Sigstore bundle certificates. If `openssl` is missing, the chain output will omit the `Signer SAN` field but verification still succeeds — `cosign verify-blob` does not depend on this.
+
+### 6. grype (Optional, for `--scan`)
+
+Used by `--scan` in image mode to run a vulnerability scan against each
+verified image. Chainguard-published OpenVEX attestations, when present,
+are passed to grype as `--vex` to produce an actionable (VEX-adjusted)
+CVE count alongside the raw count.
+
+**Installation:**
+```bash
+# macOS
+brew install grype
+
+# Linux (script install)
+curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+
+# Or via Go
+go install github.com/anchore/grype/cmd/grype@latest
+```
+
+**First run:** grype downloads its vulnerability database on first use
+(~30s, ~200MB). Subsequent runs are fast.
+
+**Documentation:** https://github.com/anchore/grype
+
+### 7. syft (Optional, for `--sbom-drift`)
+
+Used by `--sbom-drift` in image mode to generate a local SBOM and diff
+its PURL set against the attested SBOM. Flags registry-side SBOM
+substitution where a signed SBOM describes a different image's packages.
+
+**Installation:**
+```bash
+# macOS
+brew install syft
+
+# Linux (script install)
+curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+```
+
+**Documentation:** https://github.com/anchore/syft
+
+### 8. rekor-cli (Optional)
 
 Used for direct transparency log queries. The tool extracts Rekor data from signatures, but you can use rekor-cli for manual verification.
 
@@ -85,4 +142,8 @@ Before running the verification tool, authenticate with Chainguard:
 chainctl auth login
 ```
 
-For full verification mode (verifying against `chainguard-private`), you need access to the reference organization. Contact Chainguard support if you need this access.
+For full `image` verification mode (verifying against `chainguard-private`), you need access to the reference organization. Contact Chainguard support if you need this access.
+
+For `library` mode, the tool acquires short-lived pull tokens at runtime via
+`chainctl auth pull-token create --repository={java|python|javascript} --parent=<org> --ttl=1h --output=json`
+so the authenticated user must have the libraries entitlement for the given parent org. No additional setup is required beyond `chainctl auth login`.
