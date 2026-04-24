@@ -1643,9 +1643,13 @@ Examples:
     p.add_argument("--customer-org",
                    help="Customer organization to verify (required unless --version)")
     p.add_argument("--full", action="store_true",
-                   help="Full verification mode: also verify base digest exists in "
-                        "chainguard-private and was signed by Chainguard's build system "
-                        "(implies --verify-signatures)")
+                   help="Run every verification check: base digest exists in "
+                        "chainguard-private, base image signed by Chainguard's build "
+                        "system, all signed attestations (SLSA, SBOM, apko, EOL) "
+                        "retrieved and in-toto-subject-matched, policy allowlists "
+                        "evaluated, freshness/FIPS surfaced. Implies both "
+                        "--verify-signatures and --verify-attestations. Does NOT "
+                        "imply --scan (vulnerability scanning is opt-in).")
     p.add_argument("--verify-signatures", action="store_true",
                    help="Enable full cryptographic signature verification")
     p.add_argument("--verify-attestations", action="store_true",
@@ -1699,9 +1703,14 @@ Examples:
 
 
 def run_image_mode(args: argparse.Namespace) -> None:
-    # --full implies --verify-signatures
+    # --full means "run every verification check we have": signature,
+    # Rekor SET, SLSA provenance, SBOM, policy allowlists, freshness/EOL,
+    # FIPS detection, apko config. It intentionally does NOT imply --scan,
+    # because vulnerability scanning is a separate concern (risk posture,
+    # not authenticity) and grype takes minutes per image.
     if args.full:
         args.verify_signatures = True
+        args.verify_attestations = True
     # --scan implies --verify-attestations (we need to pull OpenVEX).
     # --sbom-drift also needs the attested SBOM to diff against.
     if args.scan or args.sbom_drift:

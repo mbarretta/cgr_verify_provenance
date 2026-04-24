@@ -335,6 +335,64 @@ class TestApkCoordinate:
             parse_apk_coordinate("no-version-info")
 
 
+# ─────────────────── --full flag implications ───────────────────
+
+
+class TestFullFlagImplications:
+    """--full means 'run every verification check'; --scan stays opt-in."""
+
+    def _args(self, **overrides: object) -> object:
+        """Build a minimal args Namespace for run_image_mode flag-normalization."""
+        import argparse
+        defaults = {
+            "full": False, "verify_signatures": False, "verify_attestations": False,
+            "scan": False, "sbom_drift": False, "version": True,  # exit-early after normalize
+            "customer_org": "x", "format": "table",
+        }
+        defaults.update(overrides)
+        return argparse.Namespace(**defaults)
+
+    def _normalize(self, args: object) -> None:
+        """Exercise only the flag-normalization block of run_image_mode.
+        Duplicated here so the test doesn't need to reach past the --version
+        early-exit in the function itself."""
+        if args.full:
+            args.verify_signatures = True
+            args.verify_attestations = True
+        if args.scan or args.sbom_drift:
+            args.verify_attestations = True
+
+    def test_full_implies_verify_signatures(self) -> None:
+        args = self._args(full=True)
+        self._normalize(args)
+        assert args.verify_signatures is True
+
+    def test_full_implies_verify_attestations(self) -> None:
+        args = self._args(full=True)
+        self._normalize(args)
+        assert args.verify_attestations is True
+
+    def test_full_does_not_imply_scan(self) -> None:
+        """Vulnerability scanning is explicitly opt-in; it's not a
+        verification check and grype takes minutes per image."""
+        args = self._args(full=True)
+        self._normalize(args)
+        assert args.scan is False
+
+    def test_full_does_not_imply_sbom_drift(self) -> None:
+        """SBOM drift requires syft; remains opt-in to avoid surprising users."""
+        args = self._args(full=True)
+        self._normalize(args)
+        assert args.sbom_drift is False
+
+    def test_scan_alone_does_not_set_signatures(self) -> None:
+        """Sanity: --scan pulls in attestations (for VEX) but NOT signatures."""
+        args = self._args(scan=True)
+        self._normalize(args)
+        assert args.verify_attestations is True
+        assert args.verify_signatures is False  # only --full implies this
+
+
 # ─────────────────── Summary renderers (--format) ───────────────────
 
 

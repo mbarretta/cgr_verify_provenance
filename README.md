@@ -66,11 +66,22 @@ Requires access to `chainguard-private` reference organization.
 ./verify_provenance.py image --customer-org your-org-name --full
 ```
 
-Additionally verifies:
+`--full` means "run every verification check we have." It implies both
+`--verify-signatures` and `--verify-attestations`, so a single flag
+produces:
 
 4. Base digest exists in reference org
 5. Base image has valid build signature from Chainguard's GitHub workflow
-6. Base image build signature is recorded in Rekor
+6. Base image build signature is recorded in Rekor and SET-verified
+7. SLSA v1.0 provenance, SPDX (or CycloneDX) SBOM, apko image config, and
+   (when present) end-of-life attestations retrieved, cosign-verified,
+   and in-toto subject-digest-matched against the image
+8. Policy allowlist evaluated against the SLSA `builder.id` + source URI
+9. Freshness + FIPS variant surfaced
+
+**Not** implied by `--full`: `--scan` (vulnerability scanning is a
+separate concern, requires `grype`, and takes minutes per image) and
+`--sbom-drift` (requires `syft`). Layer either on as needed.
 
 ### Image mode — Attestation Verification (optional)
 
@@ -202,7 +213,9 @@ is present, it's used with a visible freshness note.
 
 ```
 verify-provenance image --customer-org ORG        Customer organization (required)
-                        --full                    Full verification (implies --verify-signatures)
+                        --full                    All verification checks: implies
+                                                  --verify-signatures + --verify-attestations
+                                                  (NOT --scan, which is opt-in)
                         --verify-signatures       Enable cryptographic signature verification
                         --verify-attestations     Fetch + verify SLSA provenance + SBOM + apko
                                                   (asserts in-toto subject == image digest)
