@@ -213,6 +213,18 @@ class TestEvaluateSlsaPolicy:
         assert evaluate_slsa_policy(prov, default_build_policy()) == []
         assert evaluate_slsa_policy(prov, default_customer_policy()) == []
 
+    def test_apko_regex_rejects_sibling_repos(self) -> None:
+        """The apko builder regex must not match `terraform-provider-apko-*`
+        sibling repos — a valid boundary char (`/` or `@`) must follow."""
+        for bogus in (
+            "https://github.com/chainguard-dev/terraform-provider-apko-malicious",
+            "https://github.com/chainguard-dev/terraform-provider-apkollama/evil",
+            "https://github.com/chainguard-dev/terraform-provider-apko.attacker.com/x",
+        ):
+            prov = _FakeSlsa(builder_id=bogus, source_uri="")
+            checks = {v.check for v in evaluate_slsa_policy(prov, default_build_policy())}
+            assert "builder_id" in checks, f"regex over-matched {bogus!r}"
+
     def test_empty_allowlist_is_permissive(self) -> None:
         """Empty allowlist means 'no policy' — caller opted out of that check."""
         prov = _FakeSlsa(builder_id="anything", source_uri="anything")

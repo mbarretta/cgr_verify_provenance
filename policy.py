@@ -50,23 +50,28 @@ DEFAULT_CUSTOMER_IDENTITY_REGEX = r".*"
 DEFAULT_BUILD_ISSUER_REGEX = r"^https://token\.actions\.githubusercontent\.com.*$"
 DEFAULT_BUILD_IDENTITY_REGEX = r".*chainguard.*"
 
+# apko Terraform provider, named as builder.id by customer-private & public
+# apko-built images (buildType=https://apko.dev/slsa-build-type@v1). The
+# `(?:[/@].*)?$` suffix anchors the repo-name boundary so sibling repos like
+# `terraform-provider-apko-anything` cannot slip through.
+APKO_TF_PROVIDER_BUILDER_ID_REGEX = (
+    r"^https://github\.com/chainguard-dev/terraform-provider-apko(?:[/@].*)?$"
+)
+
 # SLSA `builder.id` regex allowlists. Any one match passes.
 DEFAULT_BUILD_BUILDER_IDS = [
     # Public-registry images: chainguard-images/images release workflow
     r"^https://token\.actions\.githubusercontent\.com/chainguard-images/images/\.github/workflows/.*$",
     # Any github.com/chainguard-images/* workflow run URL (builder.id varies by image)
     r"^https?://github\.com/chainguard-images/.*$",
-    # Customer-private & public apko-built images name the apko Terraform provider
-    # as builder.id (buildType=https://apko.dev/slsa-build-type@v1).
-    r"^https://github\.com/chainguard-dev/terraform-provider-apko.*$",
+    APKO_TF_PROVIDER_BUILDER_ID_REGEX,
 ]
 DEFAULT_CUSTOMER_BUILDER_IDS = [
     # Enforce-built customer images (catalog syncer / apko builder)
     r"^https?://issuer\.enforce\.dev/.*$",
     # Some Chainguard customer-org attestations still name the GHA builder
     r"^https://token\.actions\.githubusercontent\.com/chainguard-images/.*$",
-    # apko Terraform provider (same builder used for customer-private images)
-    r"^https://github\.com/chainguard-dev/terraform-provider-apko.*$",
+    APKO_TF_PROVIDER_BUILDER_ID_REGEX,
 ]
 
 # SLSA `externalParameters.source.uri` regex allowlists. Includes `^$` because
