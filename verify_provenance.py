@@ -39,6 +39,8 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from attestation import AttestationRecord
     from policy import IdentityPolicy, PolicyViolation
 
@@ -1874,76 +1876,27 @@ def run_image_mode(args: argparse.Namespace) -> None:
     # Sort by image name
     results.sort(key=lambda r: r.image)
 
-    # Write CSV only when --csv-output is set. The schema includes full
-    # base_digest for cross-customer comparison. Attestation columns
-    # (`slsa_status`, `sbom_*`) are appended at the end before `error` so
-    # readers that index by earlier column positions keep working.
+    # Write CSV only when --csv-output is set. Column groups are dropped
+    # when the corresponding check didn't run — otherwise a 0 in vuln_total
+    # misreads as "clean" when the scan was never done.
     csv_file: str | None = args.csv_output
     if csv_file:
-        with open(csv_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            if customer_only:
-                writer.writerow([
-                    "image", "base_digest", "rekor_status", "rekor_log_index",
-                    "rekor_url", "rekor_verified", "signature_status",
-                    "verification_status", "slsa_status", "sbom_status",
-                    "sbom_format", "sbom_package_count", "policy_status",
-                    "policy_violations", "vuln_status", "vuln_critical",
-                    "vuln_high", "vuln_medium", "vuln_low", "vuln_total",
-                    "vex_applied", "kev_status", "kev_count", "kev_cves",
-                    "image_age_days", "freshness_status", "fips_variant",
-                    "error"
-                ])
-                for r in results:
-                    rekor_url = r.chain.customer_rekor_url or ""
-                    writer.writerow([
-                        r.image, r.chain.base_digest_full, r.rekor_status,
-                        r.chain.customer_rekor_index, rekor_url,
-                        str(r.chain.rekor_verified).lower(), r.sig_status,
-                        r.status, r.slsa_status, r.sbom_status, r.sbom_format,
-                        r.sbom_package_count, r.policy_status,
-                        _format_policy_violations(r.chain.policy_violations),
-                        r.vuln_status, r.vuln_critical, r.vuln_high,
-                        r.vuln_medium, r.vuln_low, r.vuln_total,
-                        str(r.vex_applied).lower(), r.kev_status, r.kev_count,
-                        _format_kev_hits(r.chain.kev_hits),
-                        r.chain.image_age_days, r.freshness_status,
-                        str(r.fips_variant).lower(), r.error
-                    ])
-            else:
-                writer.writerow([
-                    "image", "base_digest", "reference_status", "rekor_status",
-                    "rekor_log_index", "rekor_url", "rekor_verified",
-                    "signature_status", "verification_status", "slsa_status",
-                    "sbom_status", "sbom_format", "sbom_package_count",
-                    "policy_status", "policy_violations", "vuln_status",
-                    "vuln_critical", "vuln_high", "vuln_medium", "vuln_low",
-                    "vuln_total", "vex_applied", "kev_status", "kev_count",
-                    "kev_cves", "error"
-                ])
-                for r in results:
-                    rekor_url = ""
-                    if r.rekor_log_index:
-                        rekor_url = f"https://search.sigstore.dev/?logIndex={r.rekor_log_index}"
-                    writer.writerow([
-                        r.image, r.chain.base_digest_full, r.ref_status, r.rekor_status,
-                        r.rekor_log_index, rekor_url,
-                        str(r.chain.rekor_verified).lower(), r.sig_status, r.status,
-                        r.slsa_status, r.sbom_status, r.sbom_format,
-                        r.sbom_package_count, r.policy_status,
-                        _format_policy_violations(r.chain.policy_violations),
-                        r.vuln_status, r.vuln_critical, r.vuln_high,
-                        r.vuln_medium, r.vuln_low, r.vuln_total,
-                        str(r.vex_applied).lower(), r.kev_status, r.kev_count,
-                        _format_kev_hits(r.chain.kev_hits),
-                        r.chain.image_age_days, r.freshness_status,
-                        str(r.fips_variant).lower(), r.error
-                    ])
+        _write_on_disk_csv(
+            csv_file, results, customer_only,
+            attestations_on=bool(args.verify_attestations),
+            scan_on=bool(args.scan),
+        )
 
     # Count results
     counts: dict[str, int] = {}
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1
+
+    # Which check groups actually ran this invocation — drives dynamic
+    # column inclusion in every format so readers never see a 0 that's
+    # really "not checked".
+    attestations_on = bool(args.verify_attestations)
+    scan_on = bool(args.scan)
 
     # Emit the summary in the requested format BEFORE the fleet-wide counts
     # block. JSON/CSV callers typically don't want the decorative counts.
@@ -1953,12 +1906,16 @@ def run_image_mode(args: argparse.Namespace) -> None:
         # Skip the rest of the decorative output.
         sys.exit(_compute_exit_status(results, counts, customer_only))
     elif args.format == "csv":
-        print(_render_summary_csv(results, customer_only))
+        print(_render_summary_csv(results, customer_only,
+                                  attestations_on=attestations_on,
+                                  scan_on=scan_on))
         sys.exit(_compute_exit_status(results, counts, customer_only))
 
     # Per-image summary table (always rendered in table mode).
     print()
-    print(_render_summary_table(results))
+    print(_render_summary_table(results,
+                                attestations_on=attestations_on,
+                                scan_on=scan_on))
 
     # Fleet-wide counts
     print()
@@ -2071,68 +2028,191 @@ def run_image_mode(args: argparse.Namespace) -> None:
         print("\n✓ ALL IMAGES VERIFIED")
 
 
+def _write_on_disk_csv(
+    csv_file: str,
+    results: list[VerificationResult],
+    customer_only: bool,
+    attestations_on: bool,
+    scan_on: bool,
+) -> None:
+    """Emit the detailed on-disk CSV (wider schema than the summary table).
+
+    Columns are grouped so entire check-groups drop together when not run:
+    - Base (always): image, digest, rekor fields, signature, verdict, error
+    - Attestations: slsa_*, sbom_*, policy_*
+    - Scan: vuln_*, vex_applied, kev_*
+    - Freshness/FIPS (always): image_age_days, freshness_status, fips_variant
+    """
+    # Build header + per-row generators in lock-step so columns can't drift.
+    def base_cols(r: VerificationResult) -> list[str | int]:
+        if customer_only:
+            rekor_url = r.chain.customer_rekor_url or ""
+            return [
+                r.image, r.chain.base_digest_full, r.rekor_status,
+                r.chain.customer_rekor_index, rekor_url,
+                str(r.chain.rekor_verified).lower(), r.sig_status, r.status,
+            ]
+        rekor_url = (
+            f"https://search.sigstore.dev/?logIndex={r.rekor_log_index}"
+            if r.rekor_log_index else ""
+        )
+        return [
+            r.image, r.chain.base_digest_full, r.ref_status, r.rekor_status,
+            r.rekor_log_index, rekor_url,
+            str(r.chain.rekor_verified).lower(), r.sig_status, r.status,
+        ]
+
+    base_headers = (
+        ["image", "base_digest", "rekor_status", "rekor_log_index",
+         "rekor_url", "rekor_verified", "signature_status", "verification_status"]
+        if customer_only else
+        ["image", "base_digest", "reference_status", "rekor_status",
+         "rekor_log_index", "rekor_url", "rekor_verified",
+         "signature_status", "verification_status"]
+    )
+    attest_headers = [
+        "slsa_status", "sbom_status", "sbom_format", "sbom_package_count",
+        "policy_status", "policy_violations",
+    ]
+    scan_headers = [
+        "vuln_status", "vuln_critical", "vuln_high", "vuln_medium",
+        "vuln_low", "vuln_total", "vex_applied", "kev_status", "kev_count",
+        "kev_cves",
+    ]
+    tail_headers = ["image_age_days", "freshness_status", "fips_variant", "error"]
+
+    def attest_cols(r: VerificationResult) -> list[object]:
+        return [
+            r.slsa_status, r.sbom_status, r.sbom_format, r.sbom_package_count,
+            r.policy_status, _format_policy_violations(r.chain.policy_violations),
+        ]
+
+    def scan_cols(r: VerificationResult) -> list[object]:
+        return [
+            r.vuln_status, r.vuln_critical, r.vuln_high, r.vuln_medium,
+            r.vuln_low, r.vuln_total, str(r.vex_applied).lower(),
+            r.kev_status, r.kev_count, _format_kev_hits(r.chain.kev_hits),
+        ]
+
+    def tail_cols(r: VerificationResult) -> list[object]:
+        return [
+            r.chain.image_age_days, r.freshness_status,
+            str(r.fips_variant).lower(), r.error,
+        ]
+
+    headers = list(base_headers)
+    if attestations_on:
+        headers += attest_headers
+    if scan_on:
+        headers += scan_headers
+    headers += tail_headers
+
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for r in results:
+            row: list[object] = list(base_cols(r))
+            if attestations_on:
+                row += attest_cols(r)
+            if scan_on:
+                row += scan_cols(r)
+            row += tail_cols(r)
+            writer.writerow(row)
+
+
 # ─────────────────────── Summary renderers (--format) ───────────────────────
 
-# Canonical column order for the summary table / CSV. JSON uses keys instead
-# so column order isn't load-bearing there, but we keep the same field
-# names so the three formats carry equivalent information.
-_SUMMARY_COLUMNS = [
-    "IMAGE", "VERDICT", "SIG", "REKOR", "SLSA", "SBOM", "POLICY",
-    "VULN", "KEV", "AGE", "FIPS",
-]
+# Column groups that only make sense when a particular check actually ran.
+# Default-zero numeric fields (CVE counts, KEV count) would misread as
+# "clean" in a run that never looked — so when a check is off, its column
+# group is dropped from all three output formats entirely.
+#
+# Always-on columns: IMAGE, VERDICT, SIG, REKOR, AGE, FIPS
+# --verify-attestations → SLSA, SBOM, POLICY
+# --scan               → VULN, KEV
 
 
-def _summary_row(r: VerificationResult) -> list[str]:
-    """Build one summary row. Compact encodings so the table fits on stdout
-    without needing a horizontal scroll in most terminals."""
-    # SBOM column: status with package count appended when we have one.
-    sbom = r.sbom_status
-    if r.sbom_package_count:
-        sbom = f"{r.sbom_status}({r.sbom_package_count})"
-
-    # Rekor column: tri-state (✓ verified, ✗ not verified though present, - absent).
+def _fmt_rekor(r: VerificationResult) -> str:
+    """Tri-state: ✓ = SET cryptographically verified, ✗ = bundle claim
+    only (not verified), - = no bundle entry."""
     if r.chain.rekor_verified:
-        rekor = "✓"
-    elif r.rekor_status == "EXISTS":
-        rekor = "✗"  # bundle-claimed but not cosign-verified
-    else:
-        rekor = "-"
+        return "✓"
+    if r.rekor_status == "EXISTS":
+        return "✗"
+    return "-"
 
-    # Vuln column: compact C/H/M/L with a * suffix when VEX was applied.
-    if r.vuln_status == "N/A":
-        vuln = "N/A"
-    else:
-        vuln = (
-            f"{r.vuln_critical}C/{r.vuln_high}H/{r.vuln_medium}M/{r.vuln_low}L"
-        )
-        if r.vex_applied:
-            vuln += "*"
 
-    # KEV column: count, or "N/A" when the check didn't run.
-    kev = "N/A" if r.kev_status == "N/A" else str(r.kev_count)
+def _fmt_sbom(r: VerificationResult) -> str:
+    if r.sbom_package_count:
+        return f"{r.sbom_status}({r.sbom_package_count})"
+    return r.sbom_status
 
-    # Age column: number of days + a terse status tag. FRESH gets no tag
-    # to keep the common case short.
+
+def _fmt_vuln(r: VerificationResult) -> str:
+    """Compact C/H/M/L; trailing * = VEX-adjudicated."""
+    s = f"{r.vuln_critical}C/{r.vuln_high}H/{r.vuln_medium}M/{r.vuln_low}L"
+    return s + "*" if r.vex_applied else s
+
+
+def _fmt_kev(r: VerificationResult) -> str:
+    return str(r.kev_count)
+
+
+def _fmt_age(r: VerificationResult) -> str:
     if r.chain.image_age_days < 0:
-        age = "?"
-    else:
-        age = f"{r.chain.image_age_days}d"
-        if r.freshness_status not in ("FRESH", "N/A"):
-            age = f"{age} {r.freshness_status}"
+        return "?"
+    age = f"{r.chain.image_age_days}d"
+    if r.freshness_status not in ("FRESH", "N/A"):
+        age += f" {r.freshness_status}"
+    return age
 
-    fips = "yes" if r.fips_variant else "no"
 
-    return [
-        r.image, r.status, r.sig_status, rekor, r.slsa_status, sbom,
-        r.policy_status, vuln, kev, age, fips,
+def _fmt_fips(r: VerificationResult) -> str:
+    return "yes" if r.fips_variant else "no"
+
+
+def _build_summary_columns(
+    attestations_on: bool,
+    scan_on: bool,
+) -> list[tuple[str, str, "Callable[[VerificationResult], str]"]]:
+    """Return (header, json_key, getter) tuples for the columns that apply
+    to this run. Order matches the canonical table layout."""
+    cols: list[tuple[str, str, "Callable[[VerificationResult], str]"]] = [
+        ("IMAGE", "image", lambda r: r.image),
+        ("VERDICT", "verdict", lambda r: r.status),
+        ("SIG", "signature", lambda r: r.sig_status),
+        ("REKOR", "rekor", _fmt_rekor),
     ]
+    if attestations_on:
+        cols += [
+            ("SLSA", "slsa", lambda r: r.slsa_status),
+            ("SBOM", "sbom", _fmt_sbom),
+            ("POLICY", "policy", lambda r: r.policy_status),
+        ]
+    if scan_on:
+        cols += [
+            ("VULN", "vuln", _fmt_vuln),
+            ("KEV", "kev", _fmt_kev),
+        ]
+    cols += [
+        ("AGE", "age", _fmt_age),
+        ("FIPS", "fips", _fmt_fips),
+    ]
+    return cols
 
 
-def _render_summary_table(results: list[VerificationResult]) -> str:
+def _render_summary_table(
+    results: list[VerificationResult],
+    attestations_on: bool = True,
+    scan_on: bool = True,
+) -> str:
     """Render an ASCII table sized to content. Minimal dependencies — no rich,
     no tabulate. Plain stdlib."""
-    rows = [_summary_row(r) for r in results]
-    widths = [len(h) for h in _SUMMARY_COLUMNS]
+    columns = _build_summary_columns(attestations_on, scan_on)
+    headers = [c[0] for c in columns]
+    rows = [[c[2](r) for c in columns] for r in results]
+
+    widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
             widths[i] = max(widths[i], len(cell))
@@ -2140,21 +2220,21 @@ def _render_summary_table(results: list[VerificationResult]) -> str:
     def fmt_row(row: list[str]) -> str:
         return "  ".join(cell.ljust(w) for cell, w in zip(row, widths, strict=True))
 
-    lines = [
-        fmt_row(_SUMMARY_COLUMNS),
-        "  ".join("-" * w for w in widths),
-    ]
+    lines = [fmt_row(headers), "  ".join("-" * w for w in widths)]
     for row in rows:
         lines.append(fmt_row(row))
 
-    # Legend for the compact encodings.
-    lines.append("")
-    lines.append(
+    # Legend for the compact encodings. Only print legend lines for columns
+    # the caller actually rendered so the output isn't misleading.
+    legend: list[str] = [
         "  Legend: REKOR ✓=SET cryptographically verified, ✗=bundle claim only, -=absent"
-    )
-    lines.append(
-        "          VULN  C/H/M/L counts; trailing * = OpenVEX adjudication applied"
-    )
+    ]
+    if scan_on:
+        legend.append(
+            "          VULN  C/H/M/L counts; trailing * = OpenVEX adjudication applied"
+        )
+    lines.append("")
+    lines.extend(legend)
     return "\n".join(lines)
 
 
@@ -2166,42 +2246,66 @@ def _render_summary_json(
     csv_file: str | None,
     counts: dict[str, int],
 ) -> str:
-    """Machine-readable JSON. Each image is a flat object; a top-level
-    `summary` captures the fleet-wide counts + run metadata."""
+    """Machine-readable JSON. Each image is a flat object whose keys are
+    gated on which checks ran — missing-because-not-checked is
+    unambiguous when the keys themselves are absent.
+
+    `image`, `verdict`, `signature`, `rekor_verified`, `rekor_log_index`,
+    `image_age_days`, `freshness_status`, `fips_variant`, `error` are
+    always present.
+    """
+    attestations_on = bool(args.verify_attestations)
+    scan_on = bool(args.scan)
+
     per_image = []
     for r in results:
-        per_image.append({
+        obj: dict[str, object] = {
             "image": r.image,
             "base_digest": r.chain.base_digest_full,
             "verdict": r.status,
             "signature": r.sig_status,
             "rekor_verified": r.chain.rekor_verified,
             "rekor_log_index": r.chain.rekor_log_index or r.chain.customer_rekor_index,
-            "slsa_status": r.slsa_status,
-            "sbom_status": r.sbom_status,
-            "sbom_format": r.sbom_format,
-            "sbom_package_count": r.sbom_package_count,
-            "policy_status": r.policy_status,
-            "vuln_status": r.vuln_status,
-            "vuln_critical": r.vuln_critical,
-            "vuln_high": r.vuln_high,
-            "vuln_medium": r.vuln_medium,
-            "vuln_low": r.vuln_low,
-            "vuln_total": r.vuln_total,
-            "vex_applied": r.vex_applied,
-            "kev_status": r.kev_status,
-            "kev_count": r.kev_count,
             "image_age_days": r.chain.image_age_days,
             "freshness_status": r.freshness_status,
             "fips_variant": r.fips_variant,
             "error": r.error,
-        })
+        }
+        if attestations_on:
+            obj.update({
+                "slsa_status": r.slsa_status,
+                "sbom_status": r.sbom_status,
+                "sbom_format": r.sbom_format,
+                "sbom_package_count": r.sbom_package_count,
+                "policy_status": r.policy_status,
+            })
+        if scan_on:
+            obj.update({
+                "vuln_status": r.vuln_status,
+                "vuln_critical": r.vuln_critical,
+                "vuln_high": r.vuln_high,
+                "vuln_medium": r.vuln_medium,
+                "vuln_low": r.vuln_low,
+                "vuln_total": r.vuln_total,
+                "vex_applied": r.vex_applied,
+                "kev_status": r.kev_status,
+                "kev_count": r.kev_count,
+            })
+        per_image.append(obj)
+
     out = {
         "customer_org": args.customer_org,
         "reference_org": reference_org if not customer_only else None,
         "mode": "delivery" if customer_only else "full",
         "tool_version": __version__,
         "csv_file": csv_file,
+        "checks_run": {
+            "signature": True,  # always attempted
+            "rekor": True,
+            "attestations": attestations_on,
+            "scan": scan_on,
+            "sbom_drift": bool(args.sbom_drift),
+        },
         "total": len(results),
         "verdict_counts": counts,
         "results": per_image,
@@ -2209,16 +2313,21 @@ def _render_summary_json(
     return json.dumps(out, indent=2, sort_keys=True)
 
 
-def _render_summary_csv(results: list[VerificationResult], customer_only: bool) -> str:
-    """Same schema as the on-disk CSV file, but emitted to stdout for
-    pipelining. We intentionally DON'T re-include the fleet counts —
-    callers can recompute from the rows."""
+def _render_summary_csv(
+    results: list[VerificationResult],
+    customer_only: bool,
+    attestations_on: bool = True,
+    scan_on: bool = True,
+) -> str:
+    """Same column gating as the summary table — when a check is off,
+    its columns are dropped entirely rather than emitted as zeros or N/A."""
     import io
+    columns = _build_summary_columns(attestations_on, scan_on)
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(_SUMMARY_COLUMNS)
+    w.writerow([c[0] for c in columns])
     for r in results:
-        w.writerow(_summary_row(r))
+        w.writerow([c[2](r) for c in columns])
     return buf.getvalue().rstrip("\n")
 
 

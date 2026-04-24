@@ -236,7 +236,14 @@ verify-provenance image --customer-org ORG        Customer organization (require
 ### Output format
 
 By default the tool prints a single summary table at the end of the run,
-one row per image and one column per check:
+one row per image and one column per check. **Columns for checks that
+weren't run are omitted entirely**, so a run without `--scan` doesn't
+show misleading `0C/0H/0M/0L` vuln rows and a run without
+`--verify-attestations` doesn't show empty `SLSA`/`SBOM`/`POLICY`
+columns. This applies to the summary table, `--format csv`, `--format
+json`, and the on-disk CSV (`--csv-output`).
+
+With `--full` (or `--scan` layered on top):
 
 ```
 IMAGE         VERDICT             SIG    REKOR  SLSA              SBOM           POLICY  VULN          KEV  AGE         FIPS

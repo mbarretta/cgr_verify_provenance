@@ -444,7 +444,7 @@ class TestSummaryRenderers:
     def test_table_has_header_and_rows(self) -> None:
         from verify_provenance import _render_summary_table
 
-        out = _render_summary_table(self._results())
+        out = _render_summary_table(self._results(), attestations_on=True, scan_on=True)
         assert "IMAGE" in out
         assert "VERDICT" in out
         assert "python" in out
@@ -459,6 +459,33 @@ class TestSummaryRenderers:
         assert "FRESH" not in python_line  # FRESH is the common case → hidden
         legacy_line = next(line for line in out.splitlines() if "legacy-app" in line)
         assert "STALE" in legacy_line
+
+    def test_table_omits_vuln_columns_when_scan_off(self) -> None:
+        """When --scan wasn't run, VULN + KEV columns must not appear."""
+        from verify_provenance import _render_summary_table
+
+        out = _render_summary_table(self._results(), attestations_on=True, scan_on=False)
+        # Column headers absent
+        header_line = out.splitlines()[0]
+        assert "VULN" not in header_line
+        assert "KEV" not in header_line
+        # Data rows don't have misleading zeros
+        assert "0C/0H/0M/0L" not in out
+        # But attestation columns still present (flag on)
+        assert "SLSA" in header_line
+        # And the VULN-specific legend line is suppressed
+        assert "OpenVEX adjudication" not in out
+
+    def test_table_omits_attestation_columns_when_off(self) -> None:
+        from verify_provenance import _render_summary_table
+
+        out = _render_summary_table(self._results(), attestations_on=False, scan_on=False)
+        header_line = out.splitlines()[0]
+        for col in ("SLSA", "SBOM", "POLICY", "VULN", "KEV"):
+            assert col not in header_line
+        # Always-on columns still there
+        for col in ("IMAGE", "VERDICT", "SIG", "REKOR", "AGE", "FIPS"):
+            assert col in header_line
 
     def test_table_columns_aligned(self) -> None:
         """Sanity: each data row is at least as wide as the header."""
@@ -477,16 +504,24 @@ class TestSummaryRenderers:
             # Row trailing spaces are stripped by ljust padding, so allow some slack
             assert len(row.rstrip()) >= header_width - 2
 
-    def test_json_output_shape(self) -> None:
+    def _full_args(self) -> object:
+        """Args Namespace with every check flag on — standard test baseline."""
         import argparse as ap
+        return ap.Namespace(
+            customer_org="test-org",
+            verify_attestations=True,
+            scan=True,
+            sbom_drift=False,
+        )
 
+    def test_json_output_shape(self) -> None:
         from verify_provenance import _render_summary_json
 
-        args = ap.Namespace(customer_org="test-org")
         results = self._results()
         counts = {"VERIFIED": 1, "KEV_HIT": 1}
         out = _render_summary_json(
-            results, args, customer_only=True, reference_org="chainguard-private",
+            results, self._full_args(), customer_only=True,
+            reference_org="chainguard-private",
             csv_file="test-org.csv", counts=counts,
         )
         doc = json.loads(out)
@@ -499,22 +534,66 @@ class TestSummaryRenderers:
         assert doc["results"][0]["image"] in ("python", "legacy-app")
         kev_row = next(r for r in doc["results"] if r["image"] == "legacy-app")
         assert kev_row["verdict"] == "KEV_HIT"
-        assert kev_row["vuln_total"] == 20
+        assert kev_row["vuln_total"] == 20  # present when scan=True
         assert kev_row["fips_variant"] is True
+        assert doc["checks_run"]["scan"] is True
+        assert doc["checks_run"]["attestations"] is True
 
     def test_json_output_with_no_csv_file(self) -> None:
         """`--csv-output` unset → no file written, csv_file field is null."""
+        from verify_provenance import _render_summary_json
+
+        out = _render_summary_json(
+            self._results(), self._full_args(), customer_only=True,
+            reference_org="chainguard-private", csv_file=None, counts={},
+        )
+        doc = json.loads(out)
+        assert doc["csv_file"] is None
+
+    def test_json_omits_vuln_keys_when_scan_off(self) -> None:
+        """Rationale: 0C/0H/0M/0L defaults misread as 'clean'; keys gone = unambiguous."""
         import argparse as ap
 
         from verify_provenance import _render_summary_json
 
-        args = ap.Namespace(customer_org="test-org")
+        args = ap.Namespace(
+            customer_org="test-org", verify_attestations=True,
+            scan=False, sbom_drift=False,
+        )
         out = _render_summary_json(
-            self._results(), args, customer_only=True, reference_org="chainguard-private",
-            csv_file=None, counts={},
+            self._results(), args, customer_only=True,
+            reference_org="chainguard-private", csv_file=None, counts={},
         )
         doc = json.loads(out)
-        assert doc["csv_file"] is None
+        row = doc["results"][0]
+        assert "vuln_total" not in row
+        assert "vuln_critical" not in row
+        assert "kev_count" not in row
+        assert "vex_applied" not in row
+        # Attestation keys still present (flag on)
+        assert "slsa_status" in row
+        # Always-present keys still present
+        assert "image" in row
+        assert "verdict" in row
+        assert doc["checks_run"]["scan"] is False
+
+    def test_json_omits_attestation_keys_when_off(self) -> None:
+        import argparse as ap
+
+        from verify_provenance import _render_summary_json
+
+        args = ap.Namespace(
+            customer_org="test-org", verify_attestations=False,
+            scan=False, sbom_drift=False,
+        )
+        out = _render_summary_json(
+            self._results(), args, customer_only=True,
+            reference_org="chainguard-private", csv_file=None, counts={},
+        )
+        row = json.loads(out)["results"][0]
+        assert "slsa_status" not in row
+        assert "sbom_status" not in row
+        assert "policy_status" not in row
 
     def test_csv_output_parseable(self) -> None:
         import csv as _csv
@@ -522,13 +601,79 @@ class TestSummaryRenderers:
 
         from verify_provenance import _render_summary_csv
 
-        out = _render_summary_csv(self._results(), customer_only=True)
+        out = _render_summary_csv(
+            self._results(), customer_only=True,
+            attestations_on=True, scan_on=True,
+        )
         reader = _csv.reader(io.StringIO(out))
         rows = list(reader)
         assert rows[0][0] == "IMAGE"
         assert len(rows) == 3  # header + 2 data rows
         # Image column matches input
         assert {rows[1][0], rows[2][0]} == {"python", "legacy-app"}
+
+    def test_csv_stdout_omits_vuln_when_scan_off(self) -> None:
+        from verify_provenance import _render_summary_csv
+
+        out = _render_summary_csv(
+            self._results(), customer_only=True,
+            attestations_on=True, scan_on=False,
+        )
+        header = out.splitlines()[0]
+        assert "VULN" not in header
+        assert "KEV" not in header
+
+    def test_on_disk_csv_omits_vuln_when_scan_off(self, tmp_path: Path) -> None:
+        """The on-disk CSV (not the stdout --format csv) must also gate."""
+        import csv as _csv
+
+        from verify_provenance import _write_on_disk_csv
+
+        csv_path = tmp_path / "out.csv"
+        _write_on_disk_csv(
+            str(csv_path), self._results(), customer_only=True,
+            attestations_on=True, scan_on=False,
+        )
+        with csv_path.open() as f:
+            rows = list(_csv.reader(f))
+        header = rows[0]
+        # Vuln column-group gone
+        for col in ("vuln_status", "vuln_critical", "vuln_high", "vuln_medium",
+                    "vuln_low", "vuln_total", "vex_applied", "kev_status",
+                    "kev_count", "kev_cves"):
+            assert col not in header, f"{col} should be gone when scan_on=False"
+        # Attestation columns still present
+        assert "slsa_status" in header
+        # Tail columns always present
+        assert "image_age_days" in header
+        assert "fips_variant" in header
+        assert "error" in header
+        # Data row width matches header width
+        assert len(rows[1]) == len(header)
+
+    def test_on_disk_csv_omits_attestation_and_vuln_when_both_off(
+        self, tmp_path: Path
+    ) -> None:
+        import csv as _csv
+
+        from verify_provenance import _write_on_disk_csv
+
+        csv_path = tmp_path / "out.csv"
+        _write_on_disk_csv(
+            str(csv_path), self._results(), customer_only=True,
+            attestations_on=False, scan_on=False,
+        )
+        with csv_path.open() as f:
+            rows = list(_csv.reader(f))
+        header = rows[0]
+        # Neither group present
+        for col in ("slsa_status", "sbom_status", "policy_status",
+                    "vuln_total", "kev_count"):
+            assert col not in header
+        # Always-on base columns
+        for col in ("image", "signature_status", "verification_status",
+                    "rekor_verified", "image_age_days", "fips_variant", "error"):
+            assert col in header
 
     def test_exit_status_verified_is_zero(self) -> None:
         from verify_provenance import _compute_exit_status
