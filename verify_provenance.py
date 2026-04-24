@@ -1682,6 +1682,16 @@ Examples:
                    help="Run syft against each image, diff the generated PURL set "
                         "against the attested SBOM. Catches registry-side SBOM-attestation "
                         "swaps. Implies --verify-attestations. Requires syft in PATH.")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="Print the full per-image verification chain "
+                        "(Step 1..10) for every image. Default output is just "
+                        "a summary table with one row per image.")
+    p.add_argument("--format", choices=["table", "json", "csv"], default="table",
+                   help="End-of-run summary format. `table` is human-readable; "
+                        "`json` and `csv` route banner/progress to stderr so "
+                        "stdout can be piped to jq / further tooling. The "
+                        "per-customer CSV file on disk is always written "
+                        "regardless of this choice.")
     p.add_argument("--limit", type=int, default=0,
                    help="Limit number of images to check (0 = all)")
     p.add_argument("--version", action="store_true",
@@ -1696,6 +1706,14 @@ def run_image_mode(args: argparse.Namespace) -> None:
     # --sbom-drift also needs the attested SBOM to diff against.
     if args.scan or args.sbom_drift:
         args.verify_attestations = True
+
+    # Route banner + progress to stderr when stdout is reserved for
+    # machine-readable output. Keeps `verify-provenance image ... --format json
+    # | jq .` clean.
+    meta_stream = sys.stderr if args.format in ("json", "csv") else sys.stdout
+
+    def _meta(line: str = "") -> None:
+        print(line, file=meta_stream)
 
     # Handle --version flag
     if args.version:
@@ -1748,18 +1766,18 @@ def run_image_mode(args: argparse.Namespace) -> None:
     # Header
     mode_desc = "DELIVERY VERIFICATION" if customer_only else "FULL VERIFICATION"
     title = f"Chainguard Image   {mode_desc}"
-    print("╔══════════════════════════════════════════════════════════════════════════════╗")
-    print(f"║{title:^78}║")
-    print("╠══════════════════════════════════════════════════════════════════════════════╣")
-    print(f"║  Customer Org:     {args.customer_org:<58}║")
+    _meta("╔══════════════════════════════════════════════════════════════════════════════╗")
+    _meta(f"║{title:^78}║")
+    _meta("╠══════════════════════════════════════════════════════════════════════════════╣")
+    _meta(f"║  Customer Org:     {args.customer_org:<58}║")
     if not customer_only:
-        print(f"║  Reference Org:    {reference_org:<58}║")
-    print(f"║  Signature Verify: {str(args.verify_signatures):<58}║")
-    print(f"║  Attestations:     {str(args.verify_attestations):<58}║")
-    print(f"║  Policy:           {policy_source:<58}║")
-    print(f"║  Vuln Scan:        {str(args.scan):<58}║")
-    print("╚══════════════════════════════════════════════════════════════════════════════╝")
-    print()
+        _meta(f"║  Reference Org:    {reference_org:<58}║")
+    _meta(f"║  Signature Verify: {str(args.verify_signatures):<58}║")
+    _meta(f"║  Attestations:     {str(args.verify_attestations):<58}║")
+    _meta(f"║  Policy:           {policy_source:<58}║")
+    _meta(f"║  Vuln Scan:        {str(args.scan):<58}║")
+    _meta("╚══════════════════════════════════════════════════════════════════════════════╝")
+    _meta()
 
     # If --scan was requested, check grype is on PATH now — fail fast rather
     # than producing partial results for half the fleet.
@@ -1781,25 +1799,27 @@ def run_image_mode(args: argparse.Namespace) -> None:
             print(f"Warning: KEV catalog unavailable ({kev_catalog.source_note}); "
                   "KEV cross-check will be skipped.", file=sys.stderr)
         else:
-            print(f"KEV catalog: {kev_catalog.total_count} entries "
+            _meta(f"KEV catalog: {kev_catalog.total_count} entries "
                   f"({kev_catalog.source_note})")
 
     # Get images
-    print(f"Fetching entitled images for '{args.customer_org}'...")
+    _meta(f"Fetching entitled images for '{args.customer_org}'...")
     images = get_image_list(args.customer_org)
 
     if not images:
         print("Error: Could not retrieve image list", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Found {len(images)} images")
+    _meta(f"Found {len(images)} images")
 
     if args.limit > 0:
         images = images[: args.limit]
-        print(f"Limited to first {args.limit} images")
+        _meta(f"Limited to first {args.limit} images")
 
-    # Verify images sequentially with detailed output
-    print("\nVerifying images...")
+    # Verify images sequentially. Verbose mode prints the full per-image chain;
+    # default mode prints a terse one-line progress indicator per image and
+    # defers the human-readable output to the end-of-run summary table.
+    _meta("\nVerifying images...")
     results: list[VerificationResult] = []
     for i, img in enumerate(images, 1):
         result = verify_image(
@@ -1816,7 +1836,11 @@ def run_image_mode(args: argparse.Namespace) -> None:
             sbom_drift_enabled=args.sbom_drift,
         )
         results.append(result)
-        print_chain_details(result, i, customer_only=customer_only)
+        if args.verbose:
+            print_chain_details(result, i, customer_only=customer_only)
+        else:
+            # Terse one-line progress per image so long runs don't look hung.
+            _meta(f"  [{i}/{len(images)}] {result.image:<40} {result.status}")
 
         if args.evidence_bundle:
             from evidence import write_evidence_bundle
@@ -1907,7 +1931,22 @@ def run_image_mode(args: argparse.Namespace) -> None:
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1
 
-    # Summary
+    # Emit the summary in the requested format BEFORE the fleet-wide counts
+    # block. JSON/CSV callers typically don't want the decorative counts.
+    if args.format == "json":
+        print(_render_summary_json(results, args, customer_only, reference_org,
+                                   csv_file, counts))
+        # Skip the rest of the decorative output.
+        sys.exit(_compute_exit_status(results, counts, customer_only))
+    elif args.format == "csv":
+        print(_render_summary_csv(results, customer_only))
+        sys.exit(_compute_exit_status(results, counts, customer_only))
+
+    # Per-image summary table (always rendered in table mode).
+    print()
+    print(_render_summary_table(results))
+
+    # Fleet-wide counts
     print()
     print("═" * 80)
     print("  SUMMARY")
@@ -2015,6 +2054,168 @@ def run_image_mode(args: argparse.Namespace) -> None:
     verified_count = counts.get("DELIVERY_VERIFIED", 0) if customer_only else counts.get("VERIFIED", 0)
     if verified_count == len(results) and len(results) > 0:
         print("\n✓ ALL IMAGES VERIFIED")
+
+
+# ─────────────────────── Summary renderers (--format) ───────────────────────
+
+# Canonical column order for the summary table / CSV. JSON uses keys instead
+# so column order isn't load-bearing there, but we keep the same field
+# names so the three formats carry equivalent information.
+_SUMMARY_COLUMNS = [
+    "IMAGE", "VERDICT", "SIG", "REKOR", "SLSA", "SBOM", "POLICY",
+    "VULN", "KEV", "AGE", "FIPS",
+]
+
+
+def _summary_row(r: VerificationResult) -> list[str]:
+    """Build one summary row. Compact encodings so the table fits on stdout
+    without needing a horizontal scroll in most terminals."""
+    # SBOM column: status with package count appended when we have one.
+    sbom = r.sbom_status
+    if r.sbom_package_count:
+        sbom = f"{r.sbom_status}({r.sbom_package_count})"
+
+    # Rekor column: tri-state (✓ verified, ✗ not verified though present, - absent).
+    if r.chain.rekor_verified:
+        rekor = "✓"
+    elif r.rekor_status == "EXISTS":
+        rekor = "✗"  # bundle-claimed but not cosign-verified
+    else:
+        rekor = "-"
+
+    # Vuln column: compact C/H/M/L with a * suffix when VEX was applied.
+    if r.vuln_status == "N/A":
+        vuln = "N/A"
+    else:
+        vuln = (
+            f"{r.vuln_critical}C/{r.vuln_high}H/{r.vuln_medium}M/{r.vuln_low}L"
+        )
+        if r.vex_applied:
+            vuln += "*"
+
+    # KEV column: count, or "N/A" when the check didn't run.
+    kev = "N/A" if r.kev_status == "N/A" else str(r.kev_count)
+
+    # Age column: number of days + a terse status tag. FRESH gets no tag
+    # to keep the common case short.
+    if r.chain.image_age_days < 0:
+        age = "?"
+    else:
+        age = f"{r.chain.image_age_days}d"
+        if r.freshness_status not in ("FRESH", "N/A"):
+            age = f"{age} {r.freshness_status}"
+
+    fips = "yes" if r.fips_variant else "no"
+
+    return [
+        r.image, r.status, r.sig_status, rekor, r.slsa_status, sbom,
+        r.policy_status, vuln, kev, age, fips,
+    ]
+
+
+def _render_summary_table(results: list[VerificationResult]) -> str:
+    """Render an ASCII table sized to content. Minimal dependencies — no rich,
+    no tabulate. Plain stdlib."""
+    rows = [_summary_row(r) for r in results]
+    widths = [len(h) for h in _SUMMARY_COLUMNS]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(row: list[str]) -> str:
+        return "  ".join(cell.ljust(w) for cell, w in zip(row, widths, strict=True))
+
+    lines = [
+        fmt_row(_SUMMARY_COLUMNS),
+        "  ".join("-" * w for w in widths),
+    ]
+    for row in rows:
+        lines.append(fmt_row(row))
+
+    # Legend for the compact encodings.
+    lines.append("")
+    lines.append(
+        "  Legend: REKOR ✓=SET cryptographically verified, ✗=bundle claim only, -=absent"
+    )
+    lines.append(
+        "          VULN  C/H/M/L counts; trailing * = OpenVEX adjudication applied"
+    )
+    return "\n".join(lines)
+
+
+def _render_summary_json(
+    results: list[VerificationResult],
+    args: argparse.Namespace,
+    customer_only: bool,
+    reference_org: str,
+    csv_file: str,
+    counts: dict[str, int],
+) -> str:
+    """Machine-readable JSON. Each image is a flat object; a top-level
+    `summary` captures the fleet-wide counts + run metadata."""
+    per_image = []
+    for r in results:
+        per_image.append({
+            "image": r.image,
+            "base_digest": r.chain.base_digest_full,
+            "verdict": r.status,
+            "signature": r.sig_status,
+            "rekor_verified": r.chain.rekor_verified,
+            "rekor_log_index": r.chain.rekor_log_index or r.chain.customer_rekor_index,
+            "slsa_status": r.slsa_status,
+            "sbom_status": r.sbom_status,
+            "sbom_format": r.sbom_format,
+            "sbom_package_count": r.sbom_package_count,
+            "policy_status": r.policy_status,
+            "vuln_status": r.vuln_status,
+            "vuln_critical": r.vuln_critical,
+            "vuln_high": r.vuln_high,
+            "vuln_medium": r.vuln_medium,
+            "vuln_low": r.vuln_low,
+            "vuln_total": r.vuln_total,
+            "vex_applied": r.vex_applied,
+            "kev_status": r.kev_status,
+            "kev_count": r.kev_count,
+            "image_age_days": r.chain.image_age_days,
+            "freshness_status": r.freshness_status,
+            "fips_variant": r.fips_variant,
+            "error": r.error,
+        })
+    out = {
+        "customer_org": args.customer_org,
+        "reference_org": reference_org if not customer_only else None,
+        "mode": "delivery" if customer_only else "full",
+        "tool_version": __version__,
+        "csv_file": csv_file,
+        "total": len(results),
+        "verdict_counts": counts,
+        "results": per_image,
+    }
+    return json.dumps(out, indent=2, sort_keys=True)
+
+
+def _render_summary_csv(results: list[VerificationResult], customer_only: bool) -> str:
+    """Same schema as the on-disk CSV file, but emitted to stdout for
+    pipelining. We intentionally DON'T re-include the fleet counts —
+    callers can recompute from the rows."""
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(_SUMMARY_COLUMNS)
+    for r in results:
+        w.writerow(_summary_row(r))
+    return buf.getvalue().rstrip("\n")
+
+
+def _compute_exit_status(
+    results: list[VerificationResult],
+    counts: dict[str, int],
+    customer_only: bool,
+) -> int:
+    """Centralized exit-status policy used by all three --format paths."""
+    if not customer_only and counts.get("NOT_FOUND", 0) > 0:
+        return 1
+    return 0
 
 
 def _build_library_subparser(subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:

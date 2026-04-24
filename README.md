@@ -212,8 +212,40 @@ verify-provenance image --customer-org ORG        Customer organization (require
                         --trusted-root FILE       Offline / air-gap mode (Sigstore TUF root)
                         --sbom-drift              Run syft locally, diff against attested SBOM
                         --evidence-bundle DIR     Emit audit-grade per-image evidence directory
+                        -v / --verbose            Print the full per-image verification chain
+                                                  (default: one-row-per-image summary table)
+                        --format {table,json,csv} End-of-run summary format (default: table).
+                                                  json/csv route banner + progress to stderr.
                         --limit N                 Limit number of images to check
 ```
+
+### Output format
+
+By default the tool prints a single summary table at the end of the run,
+one row per image and one column per check:
+
+```
+IMAGE         VERDICT             SIG    REKOR  SLSA              SBOM           POLICY  VULN          KEV  AGE         FIPS
+------------  ------------------  -----  -----  ----------------  -------------  ------  ------------  ---  ----------  ----
+python        VERIFIED            VALID  ✓      VERIFIED          VERIFIED(287)  PASS    0C/0H/0M/0L*  0    2d          no
+nginx-legacy  KEV_HIT             VALID  ✓      VERIFIED          VERIFIED(100)  PASS    2C/5H/10M/3L  1    180d STALE  yes
+redis-bad     ATTESTATION_FAILED  VALID  ✓      SUBJECT_MISMATCH  VERIFIED       N/A     N/A           N/A  5d          no
+
+  Legend: REKOR ✓=SET cryptographically verified, ✗=bundle claim only, -=absent
+          VULN  C/H/M/L counts; trailing * = OpenVEX adjudication applied
+```
+
+Use `--verbose` to get the old per-image step-by-step chain output in
+addition to the summary. Use `--format json` for machine-readable output
+pipeable to `jq`; `--format csv` for the same rows as CSV on stdout:
+
+```bash
+./verify_provenance.py image --customer-org my-org --format json \
+    | jq '.results[] | select(.verdict == "KEV_HIT")'
+```
+
+In `json` and `csv` modes, banner + progress lines are routed to stderr
+so stdout contains only the machine-readable data.
 
 ### Library-mode ecosystems
 

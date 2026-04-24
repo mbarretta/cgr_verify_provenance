@@ -333,3 +333,149 @@ class TestApkCoordinate:
 
         with pytest.raises(ValueError):
             parse_apk_coordinate("no-version-info")
+
+
+# ─────────────────── Summary renderers (--format) ───────────────────
+
+
+class TestSummaryRenderers:
+    def _results(self) -> list[VerificationResult]:
+        """Two contrived results covering the interesting value combinations:
+        one clean verified image and one with findings + KEV hit + policy failure.
+        """
+        r1 = VerificationResult(
+            image="python", base_digest="sha256:aaa", ref_status="EXISTS",
+            rekor_status="EXISTS", rekor_log_index="111", sig_status="VALID",
+            status="VERIFIED", error="",
+        )
+        r1.chain.rekor_verified = True
+        r1.chain.image_age_days = 2
+        r1.freshness_status = "FRESH"
+        r1.slsa_status = "VERIFIED"
+        r1.sbom_status = "VERIFIED"
+        r1.sbom_package_count = 287
+        r1.policy_status = "PASS"
+        r1.vuln_status = "CLEAN"
+        r1.kev_status = "CLEAN"
+        r1.vex_applied = True
+        r1.fips_variant = False
+
+        r2 = VerificationResult(
+            image="legacy-app", base_digest="sha256:bbb", ref_status="EXISTS",
+            rekor_status="EXISTS", rekor_log_index="222", sig_status="VALID",
+            status="KEV_HIT", error="",
+        )
+        r2.chain.rekor_verified = True
+        r2.chain.image_age_days = 180
+        r2.freshness_status = "STALE"
+        r2.slsa_status = "VERIFIED"
+        r2.sbom_status = "VERIFIED"
+        r2.sbom_package_count = 100
+        r2.policy_status = "PASS"
+        r2.vuln_status = "FINDINGS"
+        r2.vuln_critical = 2
+        r2.vuln_high = 5
+        r2.vuln_medium = 10
+        r2.vuln_low = 3
+        r2.vuln_total = 20
+        r2.kev_status = "HIT"
+        r2.kev_count = 1
+        r2.fips_variant = True
+        return [r1, r2]
+
+    def test_table_has_header_and_rows(self) -> None:
+        from verify_provenance import _render_summary_table
+
+        out = _render_summary_table(self._results())
+        assert "IMAGE" in out
+        assert "VERDICT" in out
+        assert "python" in out
+        assert "legacy-app" in out
+        assert "KEV_HIT" in out
+        # Compact VULN encoding for the findings row
+        assert "2C/5H/10M/3L" in out
+        # VEX star on r1
+        assert "0C/0H/0M/0L*" in out
+        # FRESH suppressed from age column; STALE kept
+        python_line = next(line for line in out.splitlines() if "python" in line)
+        assert "FRESH" not in python_line  # FRESH is the common case → hidden
+        legacy_line = next(line for line in out.splitlines() if "legacy-app" in line)
+        assert "STALE" in legacy_line
+
+    def test_table_columns_aligned(self) -> None:
+        """Sanity: each data row is at least as wide as the header."""
+        from verify_provenance import _render_summary_table
+
+        out = _render_summary_table(self._results())
+        # Everything up to the first blank line is the table; legend follows.
+        table_block = out.split("\n\n", 1)[0]
+        non_sep = [
+            ln for ln in table_block.splitlines()
+            if ln.strip() and not set(ln.strip()) <= set("- ")
+        ]
+        assert len(non_sep) == 3  # header + 2 data rows
+        header_width = len(non_sep[0])
+        for row in non_sep[1:]:
+            # Row trailing spaces are stripped by ljust padding, so allow some slack
+            assert len(row.rstrip()) >= header_width - 2
+
+    def test_json_output_shape(self) -> None:
+        import argparse as ap
+
+        from verify_provenance import _render_summary_json
+
+        args = ap.Namespace(customer_org="test-org")
+        results = self._results()
+        counts = {"VERIFIED": 1, "KEV_HIT": 1}
+        out = _render_summary_json(
+            results, args, customer_only=True, reference_org="chainguard-private",
+            csv_file="test-org.csv", counts=counts,
+        )
+        doc = json.loads(out)
+        assert doc["customer_org"] == "test-org"
+        assert doc["mode"] == "delivery"
+        assert doc["reference_org"] is None  # customer-only
+        assert doc["total"] == 2
+        assert doc["verdict_counts"] == counts
+        assert len(doc["results"]) == 2
+        assert doc["results"][0]["image"] in ("python", "legacy-app")
+        kev_row = next(r for r in doc["results"] if r["image"] == "legacy-app")
+        assert kev_row["verdict"] == "KEV_HIT"
+        assert kev_row["vuln_total"] == 20
+        assert kev_row["fips_variant"] is True
+
+    def test_csv_output_parseable(self) -> None:
+        import csv as _csv
+        import io
+
+        from verify_provenance import _render_summary_csv
+
+        out = _render_summary_csv(self._results(), customer_only=True)
+        reader = _csv.reader(io.StringIO(out))
+        rows = list(reader)
+        assert rows[0][0] == "IMAGE"
+        assert len(rows) == 3  # header + 2 data rows
+        # Image column matches input
+        assert {rows[1][0], rows[2][0]} == {"python", "legacy-app"}
+
+    def test_exit_status_verified_is_zero(self) -> None:
+        from verify_provenance import _compute_exit_status
+
+        assert _compute_exit_status(
+            self._results(), {"VERIFIED": 1, "KEV_HIT": 1}, customer_only=True
+        ) == 0
+
+    def test_exit_status_not_found_in_full_mode_is_one(self) -> None:
+        from verify_provenance import _compute_exit_status
+
+        assert _compute_exit_status(
+            self._results(), {"NOT_FOUND": 3}, customer_only=False
+        ) == 1
+
+    def test_exit_status_not_found_customer_only_is_zero(self) -> None:
+        """NOT_FOUND is meaningless in delivery mode (no reference org check)."""
+        from verify_provenance import _compute_exit_status
+
+        assert _compute_exit_status(
+            self._results(), {"NOT_FOUND": 3}, customer_only=True
+        ) == 0
