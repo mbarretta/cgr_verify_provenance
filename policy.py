@@ -56,16 +56,26 @@ DEFAULT_BUILD_BUILDER_IDS = [
     r"^https://token\.actions\.githubusercontent\.com/chainguard-images/images/\.github/workflows/.*$",
     # Any github.com/chainguard-images/* workflow run URL (builder.id varies by image)
     r"^https?://github\.com/chainguard-images/.*$",
+    # Customer-private & public apko-built images name the apko Terraform provider
+    # as builder.id (buildType=https://apko.dev/slsa-build-type@v1).
+    r"^https://github\.com/chainguard-dev/terraform-provider-apko.*$",
 ]
 DEFAULT_CUSTOMER_BUILDER_IDS = [
     # Enforce-built customer images (catalog syncer / apko builder)
     r"^https?://issuer\.enforce\.dev/.*$",
     # Some Chainguard customer-org attestations still name the GHA builder
     r"^https://token\.actions\.githubusercontent\.com/chainguard-images/.*$",
+    # apko Terraform provider (same builder used for customer-private images)
+    r"^https://github\.com/chainguard-dev/terraform-provider-apko.*$",
 ]
 
-# SLSA `externalParameters.source.uri` regex allowlists.
+# SLSA `externalParameters.source.uri` regex allowlists. Includes `^$` because
+# the apko build type (https://apko.dev/slsa-build-type@v1) builds from a
+# declarative config, not a git tree, and legitimately emits an empty
+# externalParameters (source URI absent). builder_id still constrains who is
+# allowed to produce such an attestation.
 DEFAULT_SOURCE_URIS = [
+    r"^$",
     r"^git\+?https://github\.com/chainguard-images/.*$",
     r"^https://github\.com/chainguard-images/.*$",
 ]

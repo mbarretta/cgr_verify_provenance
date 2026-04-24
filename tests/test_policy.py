@@ -198,8 +198,20 @@ class TestEvaluateSlsaPolicy:
     def test_missing_builder_id_flagged_when_allowlist_is_nonempty(self) -> None:
         prov = _FakeSlsa(builder_id="", source_uri="")
         violations = evaluate_slsa_policy(prov, default_build_policy())
-        # Both checks fail since both allowlists are non-empty in defaults
-        assert {v.check for v in violations} == {"builder_id", "source_uri"}
+        # Empty builder_id is flagged. Empty source_uri is NOT flagged under
+        # defaults — the apko build type legitimately omits it, so `^$` is
+        # in the default allowed_source_uris list.
+        assert {v.check for v in violations} == {"builder_id"}
+
+    def test_apko_builder_with_empty_source_passes_under_defaults(self) -> None:
+        """Customer-private & public apko-built images emit empty externalParameters
+        and name the apko Terraform provider as builder.id. Defaults must pass these."""
+        prov = _FakeSlsa(
+            builder_id="https://github.com/chainguard-dev/terraform-provider-apko",
+            source_uri="",
+        )
+        assert evaluate_slsa_policy(prov, default_build_policy()) == []
+        assert evaluate_slsa_policy(prov, default_customer_policy()) == []
 
     def test_empty_allowlist_is_permissive(self) -> None:
         """Empty allowlist means 'no policy' — caller opted out of that check."""
