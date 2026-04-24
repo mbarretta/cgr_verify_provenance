@@ -225,6 +225,7 @@ verify-provenance image --customer-org ORG        Customer organization (require
                         --trusted-root FILE       Offline / air-gap mode (Sigstore TUF root)
                         --sbom-drift              Run syft locally, diff against attested SBOM
                         --evidence-bundle DIR     Emit audit-grade per-image evidence directory
+                        --csv-output FILE         Write full verification CSV to disk (else no file)
                         -v / --verbose            Print the full per-image verification chain
                                                   (default: one-row-per-image summary table)
                         --format {table,json,csv} End-of-run summary format (default: table).
@@ -356,7 +357,9 @@ Detailed verification chain for each image:
 
 ### CSV Export
 
-Results are saved to `{customer-org}.csv` with columns:
+Pass `--csv-output <path>` to emit the full verification CSV to disk.
+Without the flag, no file is written (use `--format csv` to pipe the
+summary to stdout instead). The CSV columns are:
 - `image` - Image name
 - `base_digest` - Full base digest for cross-customer comparison
 - `rekor_status` - EXISTS or NOT_FOUND
@@ -411,8 +414,8 @@ To verify images are identical across customer organizations, compare the `base_
 
 ```bash
 # Run for multiple orgs
-./verify_provenance.py --customer-org org-a
-./verify_provenance.py --customer-org org-b
+./verify_provenance.py image --customer-org org-a --csv-output org-a.csv
+./verify_provenance.py image --customer-org org-b --csv-output org-b.csv
 
 # Compare base digests
 diff <(cut -d, -f2 org-a.csv | sort) <(cut -d, -f2 org-b.csv | sort)

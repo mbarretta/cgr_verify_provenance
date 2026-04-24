@@ -502,6 +502,20 @@ class TestSummaryRenderers:
         assert kev_row["vuln_total"] == 20
         assert kev_row["fips_variant"] is True
 
+    def test_json_output_with_no_csv_file(self) -> None:
+        """`--csv-output` unset → no file written, csv_file field is null."""
+        import argparse as ap
+
+        from verify_provenance import _render_summary_json
+
+        args = ap.Namespace(customer_org="test-org")
+        out = _render_summary_json(
+            self._results(), args, customer_only=True, reference_org="chainguard-private",
+            csv_file=None, counts={},
+        )
+        doc = json.loads(out)
+        assert doc["csv_file"] is None
+
     def test_csv_output_parseable(self) -> None:
         import csv as _csv
         import io

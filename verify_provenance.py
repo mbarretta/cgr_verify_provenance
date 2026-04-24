@@ -1690,6 +1690,10 @@ Examples:
                    help="Print the full per-image verification chain "
                         "(Step 1..10) for every image. Default output is just "
                         "a summary table with one row per image.")
+    p.add_argument("--csv-output",
+                   help="Write the full verification CSV to this path. When "
+                        "unset, no file is written (use `--format csv` to pipe "
+                        "the summary to stdout instead).")
     p.add_argument("--format", choices=["table", "json", "csv"], default="table",
                    help="End-of-run summary format. `table` is human-readable; "
                         "`json` and `csv` route banner/progress to stderr so "
@@ -1870,70 +1874,71 @@ def run_image_mode(args: argparse.Namespace) -> None:
     # Sort by image name
     results.sort(key=lambda r: r.image)
 
-    # Write CSV - include full base_digest for cross-customer comparison.
-    # Attestation columns (`slsa_status`, `sbom_*`) are appended at the end
-    # before `error` so readers that index by earlier column positions keep
-    # working.
-    csv_file = f"{args.customer_org}.csv"
-    with open(csv_file, "w", newline="") as f:
-        writer = csv.writer(f)
-        if customer_only:
-            writer.writerow([
-                "image", "base_digest", "rekor_status", "rekor_log_index",
-                "rekor_url", "rekor_verified", "signature_status",
-                "verification_status", "slsa_status", "sbom_status",
-                "sbom_format", "sbom_package_count", "policy_status",
-                "policy_violations", "vuln_status", "vuln_critical",
-                "vuln_high", "vuln_medium", "vuln_low", "vuln_total",
-                "vex_applied", "kev_status", "kev_count", "kev_cves",
-                "image_age_days", "freshness_status", "fips_variant",
-                "error"
-            ])
-            for r in results:
-                rekor_url = r.chain.customer_rekor_url or ""
+    # Write CSV only when --csv-output is set. The schema includes full
+    # base_digest for cross-customer comparison. Attestation columns
+    # (`slsa_status`, `sbom_*`) are appended at the end before `error` so
+    # readers that index by earlier column positions keep working.
+    csv_file: str | None = args.csv_output
+    if csv_file:
+        with open(csv_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            if customer_only:
                 writer.writerow([
-                    r.image, r.chain.base_digest_full, r.rekor_status,
-                    r.chain.customer_rekor_index, rekor_url,
-                    str(r.chain.rekor_verified).lower(), r.sig_status,
-                    r.status, r.slsa_status, r.sbom_status, r.sbom_format,
-                    r.sbom_package_count, r.policy_status,
-                    _format_policy_violations(r.chain.policy_violations),
-                    r.vuln_status, r.vuln_critical, r.vuln_high,
-                    r.vuln_medium, r.vuln_low, r.vuln_total,
-                    str(r.vex_applied).lower(), r.kev_status, r.kev_count,
-                    _format_kev_hits(r.chain.kev_hits),
-                    r.chain.image_age_days, r.freshness_status,
-                    str(r.fips_variant).lower(), r.error
+                    "image", "base_digest", "rekor_status", "rekor_log_index",
+                    "rekor_url", "rekor_verified", "signature_status",
+                    "verification_status", "slsa_status", "sbom_status",
+                    "sbom_format", "sbom_package_count", "policy_status",
+                    "policy_violations", "vuln_status", "vuln_critical",
+                    "vuln_high", "vuln_medium", "vuln_low", "vuln_total",
+                    "vex_applied", "kev_status", "kev_count", "kev_cves",
+                    "image_age_days", "freshness_status", "fips_variant",
+                    "error"
                 ])
-        else:
-            writer.writerow([
-                "image", "base_digest", "reference_status", "rekor_status",
-                "rekor_log_index", "rekor_url", "rekor_verified",
-                "signature_status", "verification_status", "slsa_status",
-                "sbom_status", "sbom_format", "sbom_package_count",
-                "policy_status", "policy_violations", "vuln_status",
-                "vuln_critical", "vuln_high", "vuln_medium", "vuln_low",
-                "vuln_total", "vex_applied", "kev_status", "kev_count",
-                "kev_cves", "error"
-            ])
-            for r in results:
-                rekor_url = ""
-                if r.rekor_log_index:
-                    rekor_url = f"https://search.sigstore.dev/?logIndex={r.rekor_log_index}"
+                for r in results:
+                    rekor_url = r.chain.customer_rekor_url or ""
+                    writer.writerow([
+                        r.image, r.chain.base_digest_full, r.rekor_status,
+                        r.chain.customer_rekor_index, rekor_url,
+                        str(r.chain.rekor_verified).lower(), r.sig_status,
+                        r.status, r.slsa_status, r.sbom_status, r.sbom_format,
+                        r.sbom_package_count, r.policy_status,
+                        _format_policy_violations(r.chain.policy_violations),
+                        r.vuln_status, r.vuln_critical, r.vuln_high,
+                        r.vuln_medium, r.vuln_low, r.vuln_total,
+                        str(r.vex_applied).lower(), r.kev_status, r.kev_count,
+                        _format_kev_hits(r.chain.kev_hits),
+                        r.chain.image_age_days, r.freshness_status,
+                        str(r.fips_variant).lower(), r.error
+                    ])
+            else:
                 writer.writerow([
-                    r.image, r.chain.base_digest_full, r.ref_status, r.rekor_status,
-                    r.rekor_log_index, rekor_url,
-                    str(r.chain.rekor_verified).lower(), r.sig_status, r.status,
-                    r.slsa_status, r.sbom_status, r.sbom_format,
-                    r.sbom_package_count, r.policy_status,
-                    _format_policy_violations(r.chain.policy_violations),
-                    r.vuln_status, r.vuln_critical, r.vuln_high,
-                    r.vuln_medium, r.vuln_low, r.vuln_total,
-                    str(r.vex_applied).lower(), r.kev_status, r.kev_count,
-                    _format_kev_hits(r.chain.kev_hits),
-                    r.chain.image_age_days, r.freshness_status,
-                    str(r.fips_variant).lower(), r.error
+                    "image", "base_digest", "reference_status", "rekor_status",
+                    "rekor_log_index", "rekor_url", "rekor_verified",
+                    "signature_status", "verification_status", "slsa_status",
+                    "sbom_status", "sbom_format", "sbom_package_count",
+                    "policy_status", "policy_violations", "vuln_status",
+                    "vuln_critical", "vuln_high", "vuln_medium", "vuln_low",
+                    "vuln_total", "vex_applied", "kev_status", "kev_count",
+                    "kev_cves", "error"
                 ])
+                for r in results:
+                    rekor_url = ""
+                    if r.rekor_log_index:
+                        rekor_url = f"https://search.sigstore.dev/?logIndex={r.rekor_log_index}"
+                    writer.writerow([
+                        r.image, r.chain.base_digest_full, r.ref_status, r.rekor_status,
+                        r.rekor_log_index, rekor_url,
+                        str(r.chain.rekor_verified).lower(), r.sig_status, r.status,
+                        r.slsa_status, r.sbom_status, r.sbom_format,
+                        r.sbom_package_count, r.policy_status,
+                        _format_policy_violations(r.chain.policy_violations),
+                        r.vuln_status, r.vuln_critical, r.vuln_high,
+                        r.vuln_medium, r.vuln_low, r.vuln_total,
+                        str(r.vex_applied).lower(), r.kev_status, r.kev_count,
+                        _format_kev_hits(r.chain.kev_hits),
+                        r.chain.image_age_days, r.freshness_status,
+                        str(r.fips_variant).lower(), r.error
+                    ])
 
     # Count results
     counts: dict[str, int] = {}
@@ -2045,7 +2050,8 @@ def run_image_mode(args: argparse.Namespace) -> None:
             print(f"  KEV Hit Images:     0  (no unadjudicated KEV-cataloged CVEs)")
 
     print()
-    print(f"  CSV Output:         {csv_file}")
+    if csv_file:
+        print(f"  CSV Output:         {csv_file}")
     print("═" * 80)
 
     if customer_only:
@@ -2157,7 +2163,7 @@ def _render_summary_json(
     args: argparse.Namespace,
     customer_only: bool,
     reference_org: str,
-    csv_file: str,
+    csv_file: str | None,
     counts: dict[str, int],
 ) -> str:
     """Machine-readable JSON. Each image is a flat object; a top-level
