@@ -497,6 +497,7 @@ def verify_sources(
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     github_token_value: str = "",
     cache: dict[tuple[str, str], UpstreamVerifyResult] | None = None,
+    executor: ThreadPoolExecutor | None = None,
 ) -> UpstreamSummary:
     """Verify every source in parallel; return an aggregated summary.
 
@@ -504,6 +505,11 @@ def verify_sources(
     many images that share APK packages (glibc, openssl, ncurses) only pay
     one network round-trip per upstream. Pass the same cache dict across
     every call in a run. Pass `None` to disable.
+
+    `executor`: optional shared thread pool. When supplied, it's reused
+    across calls (the caller owns its lifecycle) so a 200-image batch run
+    doesn't spin up 200 separate pools. When None, a one-shot executor is
+    created and torn down for this call.
     """
     summary = UpstreamSummary(total=len(sources))
     if cache is None:
@@ -557,10 +563,13 @@ def verify_sources(
                 cache[key] = r
         return r
 
-    # `max_workers=0` would crash the executor; clamp to 1.
-    workers = max(1, min(max_concurrent, len(sources) or 1))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        results = list(ex.map(_verify, sources))
+    if executor is not None:
+        results = list(executor.map(_verify, sources))
+    else:
+        # `max_workers=0` would crash the executor; clamp to 1.
+        workers = max(1, min(max_concurrent, len(sources) or 1))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(_verify, sources))
 
     summary.results = results
     for r in results:

@@ -275,6 +275,7 @@ def verify_image(
     verify_upstream_sources: bool = False,
     upstream_cache: "dict[tuple[str, str], UpstreamVerifyResult] | None" = None,
     upstream_github_token: str = "",
+    upstream_executor: "object | None" = None,
 ) -> VerificationResult:
     """Verify a single image with optional detailed chain capture."""
     customer_image = f"{registry}/{customer_org}/{image}:latest"
@@ -353,6 +354,7 @@ def verify_image(
             verify_upstream_sources=verify_upstream_sources,
             upstream_cache=upstream_cache,
             upstream_github_token=upstream_github_token,
+            upstream_executor=upstream_executor,
         )
 
     # Full mode: verify via reference org
@@ -496,6 +498,7 @@ def verify_image(
             result, chain,
             cache=upstream_cache,
             github_token_value=upstream_github_token,
+            executor=upstream_executor,
         )
 
     # Determine final status
@@ -542,6 +545,7 @@ def verify_customer_only(
     verify_upstream_sources: bool = False,
     upstream_cache: "dict[tuple[str, str], UpstreamVerifyResult] | None" = None,
     upstream_github_token: str = "",
+    upstream_executor: "object | None" = None,
 ) -> VerificationResult:
     """Verify using only customer org access (no reference org needed)."""
     # Download signature from customer image
@@ -670,6 +674,7 @@ def verify_customer_only(
             result, chain,
             cache=upstream_cache,
             github_token_value=upstream_github_token,
+            executor=upstream_executor,
         )
 
     # In customer-only mode, we mark as VERIFIED if we have signature + Rekor
@@ -1022,6 +1027,7 @@ def _verify_upstream_sources_step(
     chain: ChainDetails,
     cache: "dict[tuple[str, str], UpstreamVerifyResult] | None" = None,
     github_token_value: str = "",
+    executor: "object | None" = None,
 ) -> None:
     """Walk the verified SPDX SBOM and check every upstream source upstream.
 
@@ -1051,6 +1057,7 @@ def _verify_upstream_sources_step(
         sources,
         github_token_value=github_token_value,
         cache=cache,
+        executor=executor,  # type: ignore[arg-type]
     )
     chain.upstream_summary = summary
     result.upstream_sources_total = summary.total
@@ -2018,8 +2025,11 @@ def run_image_mode(args: argparse.Namespace) -> None:
     # tag's commit").
     upstream_cache: "dict[tuple[str, str], UpstreamVerifyResult] | None" = None
     upstream_github_token: str = ""
+    upstream_executor: "object | None" = None
     if args.verify_upstream_sources:
-        from upstream import git_installed, github_token
+        from concurrent.futures import ThreadPoolExecutor
+
+        from upstream import DEFAULT_MAX_CONCURRENT, git_installed, github_token
 
         if not git_installed():
             print("Error: --verify-upstream-sources requires git in PATH. "
@@ -2030,11 +2040,13 @@ def run_image_mode(args: argparse.Namespace) -> None:
                   "--trusted-root (the upstream check needs the public "
                   "internet)", file=sys.stderr)
             sys.exit(2)
-        # One cache shared across every image in the run; many APK packages
-        # are common across the fleet (glibc, openssl, ncurses) so the
-        # cache typically saves dozens of round-trips per run.
+        # One cache + one thread pool shared across every image in the run.
+        # Many APK packages are common across the fleet (glibc, openssl,
+        # ncurses), so the cache saves dozens of round-trips per run; one
+        # pool means we don't pay teardown/setup per image.
         upstream_cache = {}
         upstream_github_token = github_token()
+        upstream_executor = ThreadPoolExecutor(max_workers=DEFAULT_MAX_CONCURRENT)
 
     # Load CISA KEV catalog once per run; every per-image scan reuses it.
     # Failing to load isn't fatal — we continue with no KEV data and the
@@ -2085,6 +2097,7 @@ def run_image_mode(args: argparse.Namespace) -> None:
             verify_upstream_sources=args.verify_upstream_sources,
             upstream_cache=upstream_cache,
             upstream_github_token=upstream_github_token,
+            upstream_executor=upstream_executor,
         )
         results.append(result)
         if args.verbose:
@@ -2108,6 +2121,12 @@ def run_image_mode(args: argparse.Namespace) -> None:
             except OSError as e:
                 print(f"Warning: evidence bundle write failed for {result.image}: {e}",
                       file=sys.stderr)
+
+    # Tear down the shared upstream-verification thread pool before we exit
+    # the run. Workers are idle by now (verify_image() returned), but the
+    # pool object would otherwise linger until interpreter shutdown.
+    if upstream_executor is not None:
+        upstream_executor.shutdown(wait=True)  # type: ignore[attr-defined]
 
     # Sort by image name
     results.sort(key=lambda r: r.image)
