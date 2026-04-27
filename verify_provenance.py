@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
     from attestation import AttestationRecord
     from policy import IdentityPolicy, PolicyViolation
+    from upstream import UpstreamVerifyResult
 
 __version__ = "0.1.0"
 
@@ -156,6 +157,13 @@ class ChainDetails:
     # for the same reason as scan_result.
     sbom_drift: "object | None" = None
 
+    # Step 12: Upstream-source verification (--verify-upstream-sources).
+    # Walks the SPDX SBOM's relationships + purls and verifies every
+    # upstream source (git ls-remote tag→commit; tarball checksum). Loose
+    # typing for the same scan_result reason — upstream.py is only imported
+    # when the flag is set.
+    upstream_summary: "object | None" = None
+
 
 @dataclass
 class VerificationResult:
@@ -204,6 +212,15 @@ class VerificationResult:
     # SBOM drift: "N/A" | "CLEAN" | "DRIFT" | "ERROR"
     sbom_drift_status: str = "N/A"
     sbom_drift_ratio: float = 0.0
+    # Upstream-source verification: "N/A" | "VERIFIED" | "FAILED" | "ERROR".
+    # FAILED demotes the overall verdict to UPSTREAM_FAILED; ERROR (transient
+    # network/auth) does not, matching the KEV-fetch posture.
+    upstream_sources_status: str = "N/A"
+    upstream_sources_total: int = 0
+    upstream_sources_verified: int = 0
+    upstream_sources_failed: int = 0
+    upstream_sources_errors: int = 0
+    upstream_sources_skipped: int = 0
 
 
 def run_cmd(args: list[str], timeout: int = 30) -> tuple[bool, str, str]:
@@ -255,6 +272,9 @@ def verify_image(
     max_age_days: int = 0,
     trusted_root: str | None = None,
     sbom_drift_enabled: bool = False,
+    verify_upstream_sources: bool = False,
+    upstream_cache: "dict[tuple[str, str], UpstreamVerifyResult] | None" = None,
+    upstream_github_token: str = "",
 ) -> VerificationResult:
     """Verify a single image with optional detailed chain capture."""
     customer_image = f"{registry}/{customer_org}/{image}:latest"
@@ -330,6 +350,9 @@ def verify_image(
             max_age_days=max_age_days,
             trusted_root=trusted_root,
             sbom_drift_enabled=sbom_drift_enabled,
+            verify_upstream_sources=verify_upstream_sources,
+            upstream_cache=upstream_cache,
+            upstream_github_token=upstream_github_token,
         )
 
     # Full mode: verify via reference org
@@ -467,6 +490,14 @@ def verify_image(
             result, chain, image_ref=f"{reference_image}@{base_digest}"
         )
 
+    # Step 12: Upstream-source verification (--verify-upstream-sources)
+    if verify_upstream_sources:
+        _verify_upstream_sources_step(
+            result, chain,
+            cache=upstream_cache,
+            github_token_value=upstream_github_token,
+        )
+
     # Determine final status
     if result.ref_status == "EXISTS" and result.rekor_status == "EXISTS":
         result.status = "VERIFIED"
@@ -480,13 +511,18 @@ def verify_image(
     # sig+Rekor can't rescue a signed attestation that describes a
     # different image. Policy violations (wrong builder/source) demote too.
     # A KEV hit among actionable CVEs demotes VERIFIED → KEV_HIT so
-    # pipelines can gate on the single verification_status column.
+    # pipelines can gate on the single verification_status column. Upstream
+    # FAILED (SBOM claims an upstream tag/checksum that doesn't match
+    # reality) is the same flavour of integrity failure as KEV — demote
+    # VERIFIED to UPSTREAM_FAILED.
     if "SUBJECT_MISMATCH" in (result.slsa_status, result.sbom_status):
         result.status = "ATTESTATION_FAILED"
     elif result.policy_status == "VIOLATION":
         result.status = "POLICY_VIOLATION"
     elif result.kev_status == "HIT" and result.status == "VERIFIED":
         result.status = "KEV_HIT"
+    elif result.upstream_sources_status == "FAILED" and result.status == "VERIFIED":
+        result.status = "UPSTREAM_FAILED"
 
     return result
 
@@ -503,6 +539,9 @@ def verify_customer_only(
     max_age_days: int = 0,
     trusted_root: str | None = None,
     sbom_drift_enabled: bool = False,
+    verify_upstream_sources: bool = False,
+    upstream_cache: "dict[tuple[str, str], UpstreamVerifyResult] | None" = None,
+    upstream_github_token: str = "",
 ) -> VerificationResult:
     """Verify using only customer org access (no reference org needed)."""
     # Download signature from customer image
@@ -625,6 +664,14 @@ def verify_customer_only(
     if sbom_drift_enabled:
         _run_sbom_drift(result, chain, image_ref=customer_image)
 
+    # Step 12: Upstream-source verification (--verify-upstream-sources)
+    if verify_upstream_sources:
+        _verify_upstream_sources_step(
+            result, chain,
+            cache=upstream_cache,
+            github_token_value=upstream_github_token,
+        )
+
     # In customer-only mode, we mark as VERIFIED if we have signature + Rekor
     # but note that we can't verify the BASE digest, only the customer image delivery
     if chain.customer_sig_found and result.rekor_status == "EXISTS":
@@ -636,13 +683,20 @@ def verify_customer_only(
     # See note in verify_image: subject-mismatch on any attestation demotes
     # the overall verdict regardless of how well the signature + Rekor
     # steps went. Policy violations also demote. KEV hits demote VERIFIED
-    # outcomes (DELIVERY_VERIFIED specifically here).
+    # outcomes (DELIVERY_VERIFIED specifically here). Upstream FAILED
+    # demotes the same way — a forged-but-cosigned SBOM is no more
+    # trustworthy than a substituted attestation.
     if "SUBJECT_MISMATCH" in (result.slsa_status, result.sbom_status):
         result.status = "ATTESTATION_FAILED"
     elif result.policy_status == "VIOLATION":
         result.status = "POLICY_VIOLATION"
     elif result.kev_status == "HIT" and result.status == "DELIVERY_VERIFIED":
         result.status = "KEV_HIT"
+    elif (
+        result.upstream_sources_status == "FAILED"
+        and result.status == "DELIVERY_VERIFIED"
+    ):
+        result.status = "UPSTREAM_FAILED"
 
     return result
 
@@ -963,6 +1017,50 @@ def _run_sbom_drift(
     result.sbom_drift_status = "DRIFT" if drift.drift_ratio > 0.05 else "CLEAN"
 
 
+def _verify_upstream_sources_step(
+    result: VerificationResult,
+    chain: ChainDetails,
+    cache: "dict[tuple[str, str], UpstreamVerifyResult] | None" = None,
+    github_token_value: str = "",
+) -> None:
+    """Walk the verified SPDX SBOM and check every upstream source upstream.
+
+    Only meaningful with a cryptographically verified, subject-matched SPDX
+    record on `chain.attestations`. CycloneDX is not yet supported (different
+    schema; deferred). When neither is available, this step records
+    `upstream_sources_status="N/A"` and returns silently.
+    """
+    from attestation import PREDICATE_CYCLONEDX, PREDICATE_SPDX
+    from upstream import UpstreamSummary, verify_sources, walk_spdx_sources
+
+    spdx_rec = chain.attestations.get(PREDICATE_SPDX)
+    if spdx_rec is None or not (spdx_rec.verified and spdx_rec.subject_matches):
+        # No verified SPDX. CycloneDX walking isn't implemented yet — we
+        # explicitly leave status as N/A so reports don't claim a failure.
+        cyclo_rec = chain.attestations.get(PREDICATE_CYCLONEDX)
+        if cyclo_rec is not None and cyclo_rec.verified and cyclo_rec.subject_matches:
+            result.upstream_sources_status = "N/A"
+        return
+
+    sources = walk_spdx_sources(spdx_rec.predicate)
+    if not sources:
+        chain.upstream_summary = UpstreamSummary()
+        return
+
+    summary = verify_sources(
+        sources,
+        github_token_value=github_token_value,
+        cache=cache,
+    )
+    chain.upstream_summary = summary
+    result.upstream_sources_total = summary.total
+    result.upstream_sources_verified = summary.verified
+    result.upstream_sources_failed = summary.failed
+    result.upstream_sources_errors = summary.errors
+    result.upstream_sources_skipped = summary.skipped
+    result.upstream_sources_status = summary.as_status()
+
+
 def _summarize_attestation_status(rec: "AttestationRecord") -> str:
     """Signature-level summary shared by SLSA and SBOM flows."""
     if rec.verified and rec.subject_matches:
@@ -1123,6 +1221,13 @@ def print_chain_details_customer_only(result: VerificationResult, chain: ChainDe
         print(f"  │")
         print(f"  └─ ✗ {result.kev_count} actionable CVE(s) in CISA KEV catalog —")
         print(f"       known exploited, not adjudicated by producer VEX (see Step 9).")
+    elif result.status == "UPSTREAM_FAILED":
+        print(f"  │  Status: {result.status}")
+        print("  │")
+        print(f"  └─ ✗ {result.upstream_sources_failed} upstream source(s) "
+              "do NOT match the SBOM —")
+        print("       SBOM claims a tag/checksum that doesn't exist upstream "
+              "(see Step 12).")
     elif result.status == "PARTIAL":
         print(f"  │  Status: {result.status}")
         print(f"  │")
@@ -1284,6 +1389,13 @@ def print_chain_details_full(result: VerificationResult, chain: ChainDetails):
         print(f"  │")
         print(f"  └─ ✗ {result.kev_count} actionable CVE(s) in CISA KEV catalog —")
         print(f"       known exploited, not adjudicated by producer VEX (see Step 9).")
+    elif result.status == "UPSTREAM_FAILED":
+        print(f"  │  Status: {result.status}")
+        print("  │")
+        print(f"  └─ ✗ {result.upstream_sources_failed} upstream source(s) "
+              "do NOT match the SBOM —")
+        print("       SBOM claims a tag/checksum that doesn't exist upstream "
+              "(see Step 12).")
     elif result.status == "PARTIAL":
         print(f"  │  Status: {result.status}")
         print(f"  │")
@@ -1372,6 +1484,9 @@ def _print_slsa_step(result: VerificationResult, chain: ChainDetails) -> None:
     # Step 10: Freshness + EOL + FIPS posture
     _print_freshness_step(result, chain)
 
+    # Step 12: Upstream-source verification (if --verify-upstream-sources)
+    _print_upstream_step(result, chain)
+
 
 def _format_kev_hits(hits: list[object]) -> str:
     """Compact CSV-safe summary: `CVE-2023-1234(due=2023-04-01); CVE-...`."""
@@ -1383,6 +1498,23 @@ def _format_kev_hits(hits: list[object]) -> str:
             continue
         due = f"(due={h.due_date})" if h.due_date else ""
         parts.append(f"{h.cve_id}{due}")
+    return "; ".join(parts)
+
+
+def _format_upstream_failures(summary: "object | None") -> str:
+    """Compact CSV-safe summary of FAILED upstream sources.
+
+    Format: `glibc-2.43-r2(commit mismatch); openssl-3.6.1-r2(...); …`.
+    Only FAILED entries are listed — VERIFIED is silent, SKIP/ERROR are
+    aggregated into the count columns.
+    """
+    from upstream import UpstreamSummary
+
+    if not isinstance(summary, UpstreamSummary):
+        return ""
+    parts = [
+        f"{r.label}({r.detail})" for r in summary.results if r.status == "FAILED"
+    ]
     return "; ".join(parts)
 
 
@@ -1585,6 +1717,72 @@ def _print_freshness_step(result: VerificationResult, chain: ChainDetails) -> No
         print(f"  └─ ✓ Freshness + FIPS posture recorded")
 
 
+def _print_upstream_step(result: VerificationResult, chain: ChainDetails) -> None:
+    """Pretty-print --verify-upstream-sources results.
+
+    Emits a sourcier-style tree: one line per source with a status badge,
+    grouped by source_type. Long fleets won't want all this — use the
+    summary table for compact output. Verbose chain mode is opt-in already.
+    """
+    if result.upstream_sources_status == "N/A":
+        return
+    from upstream import UpstreamSummary
+
+    summary = (
+        chain.upstream_summary
+        if isinstance(chain.upstream_summary, UpstreamSummary)
+        else None
+    )
+    print("\n  ┌─ STEP 12: Verify Upstream Sources Against SBOM Claims")
+    print("  │")
+    if summary is None or summary.total == 0:
+        print("  │  Result: no source coordinates found in SBOM")
+        print("  │")
+        print("  └─ ○ Nothing to verify (SBOM has no relationship/purl edges)")
+        return
+    countable = summary.total - summary.skipped
+    print(f"  │  Sources walked: {summary.total}  "
+          f"(verified={summary.verified}, failed={summary.failed}, "
+          f"errors={summary.errors}, skipped={summary.skipped})")
+    if summary.cache_hits:
+        print(f"  │  Cache hits:     {summary.cache_hits} "
+              "(reused upstream lookups across images)")
+    print("  │")
+    badge = {
+        "VERIFIED": "✓",
+        "FAILED": "✗",
+        "ERROR": "?",
+        "SKIP": "-",
+    }
+    shown = 0
+    for r in summary.results:
+        if r.status == "VERIFIED" and shown >= 5 and summary.failed:
+            # When there are failures, prioritise showing them. Cap successful
+            # entries at 5 so a 25-source image isn't a wall of green.
+            continue
+        if shown >= 12:
+            break
+        shown += 1
+        b = badge.get(r.status, "?")
+        line = f"  │  {b} {r.label}"
+        if r.url:
+            line += f" — {r.url}"
+        print(line)
+        if r.detail:
+            print(f"  │      {r.detail}")
+    if shown < summary.total:
+        print(f"  │  … plus {summary.total - shown} more (see CSV / evidence bundle)")
+    print("  │")
+    if result.upstream_sources_status == "FAILED":
+        print(f"  └─ ✗ {summary.failed} of {countable} upstream source(s) "
+              "do NOT match the SBOM claim — image NOT trusted")
+    elif result.upstream_sources_status == "ERROR":
+        print("  └─ ⚠ Upstream verification could not complete "
+              "(transient errors); not demoting verdict")
+    else:
+        print(f"  └─ ✓ All {summary.verified} verifiable upstream source(s) match")
+
+
 def _print_kev_step(result: VerificationResult, chain: ChainDetails) -> None:
     """Pretty-print CISA KEV cross-check results."""
     if result.kev_status == "N/A":
@@ -1688,6 +1886,15 @@ Examples:
                    help="Run syft against each image, diff the generated PURL set "
                         "against the attested SBOM. Catches registry-side SBOM-attestation "
                         "swaps. Implies --verify-attestations. Requires syft in PATH.")
+    p.add_argument("--verify-upstream-sources", action="store_true",
+                   help="Walk the verified SPDX SBOM and confirm every upstream "
+                        "source matches: git-tag→commit via `git ls-remote`, "
+                        "tarball checksums via streaming hash. Catches forged "
+                        "SBOMs whose package coordinates do not exist upstream. "
+                        "Implies --verify-attestations. Network-heavy "
+                        "(~25-50 RTTs/image); requires `git` in PATH. Cannot "
+                        "be used with --trusted-root (the check is "
+                        "fundamentally network-dependent).")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Print the full per-image verification chain "
                         "(Step 1..10) for every image. Default output is just "
@@ -1719,7 +1926,9 @@ def run_image_mode(args: argparse.Namespace) -> None:
         args.verify_attestations = True
     # --scan implies --verify-attestations (we need to pull OpenVEX).
     # --sbom-drift also needs the attested SBOM to diff against.
-    if args.scan or args.sbom_drift:
+    # --verify-upstream-sources walks the SPDX SBOM, so it likewise requires
+    # a cryptographically verified SBOM upfront.
+    if args.scan or args.sbom_drift or args.verify_upstream_sources:
         args.verify_attestations = True
 
     # Route banner + progress to stderr when stdout is reserved for
@@ -1803,6 +2012,30 @@ def run_image_mode(args: argparse.Namespace) -> None:
                   file=sys.stderr)
             sys.exit(1)
 
+    # --verify-upstream-sources needs `git` for `git ls-remote`. It also can't
+    # coexist with --trusted-root (the upstream check is network-dependent
+    # by design — there's no air-gapped equivalent of "ask github for this
+    # tag's commit").
+    upstream_cache: "dict[tuple[str, str], UpstreamVerifyResult] | None" = None
+    upstream_github_token: str = ""
+    if args.verify_upstream_sources:
+        from upstream import git_installed, github_token
+
+        if not git_installed():
+            print("Error: --verify-upstream-sources requires git in PATH. "
+                  "See PREREQUISITES.md", file=sys.stderr)
+            sys.exit(1)
+        if args.trusted_root:
+            print("Error: --verify-upstream-sources is incompatible with "
+                  "--trusted-root (the upstream check needs the public "
+                  "internet)", file=sys.stderr)
+            sys.exit(2)
+        # One cache shared across every image in the run; many APK packages
+        # are common across the fleet (glibc, openssl, ncurses) so the
+        # cache typically saves dozens of round-trips per run.
+        upstream_cache = {}
+        upstream_github_token = github_token()
+
     # Load CISA KEV catalog once per run; every per-image scan reuses it.
     # Failing to load isn't fatal — we continue with no KEV data and the
     # kev_status field stays "N/A" per image.
@@ -1849,6 +2082,9 @@ def run_image_mode(args: argparse.Namespace) -> None:
             max_age_days=args.max_age_days,
             trusted_root=args.trusted_root,
             sbom_drift_enabled=args.sbom_drift,
+            verify_upstream_sources=args.verify_upstream_sources,
+            upstream_cache=upstream_cache,
+            upstream_github_token=upstream_github_token,
         )
         results.append(result)
         if args.verbose:
@@ -1885,6 +2121,7 @@ def run_image_mode(args: argparse.Namespace) -> None:
             csv_file, results, customer_only,
             attestations_on=bool(args.verify_attestations),
             scan_on=bool(args.scan),
+            upstream_on=bool(args.verify_upstream_sources),
         )
 
     # Count results
@@ -1897,6 +2134,7 @@ def run_image_mode(args: argparse.Namespace) -> None:
     # really "not checked".
     attestations_on = bool(args.verify_attestations)
     scan_on = bool(args.scan)
+    upstream_on = bool(args.verify_upstream_sources)
 
     # Emit the summary in the requested format BEFORE the fleet-wide counts
     # block. JSON/CSV callers typically don't want the decorative counts.
@@ -1908,14 +2146,16 @@ def run_image_mode(args: argparse.Namespace) -> None:
     elif args.format == "csv":
         print(_render_summary_csv(results, customer_only,
                                   attestations_on=attestations_on,
-                                  scan_on=scan_on))
+                                  scan_on=scan_on,
+                                  upstream_on=upstream_on))
         sys.exit(_compute_exit_status(results, counts, customer_only))
 
     # Per-image summary table (always rendered in table mode).
     print()
     print(_render_summary_table(results,
                                 attestations_on=attestations_on,
-                                scan_on=scan_on))
+                                scan_on=scan_on,
+                                upstream_on=upstream_on))
 
     # Fleet-wide counts
     print()
@@ -1981,6 +2221,24 @@ def run_image_mode(args: argparse.Namespace) -> None:
             print(f"  Policy Violation:   {policy_counts['VIOLATION']}  "
                   f"(attestation verified but provenance off-allowlist — REJECTED)")
 
+    if args.verify_upstream_sources:
+        upstream_total = sum(r.upstream_sources_total for r in results)
+        upstream_verified = sum(r.upstream_sources_verified for r in results)
+        upstream_failed = sum(r.upstream_sources_failed for r in results)
+        upstream_errors = sum(r.upstream_sources_errors for r in results)
+        failed_images = sum(
+            1 for r in results if r.upstream_sources_status == "FAILED"
+        )
+        print()
+        print(f"  Upstream Verified:  {upstream_verified}/{upstream_total} sources "
+              f"({failed_images} image(s) with at least one FAILED upstream)")
+        if upstream_errors:
+            print(f"  Upstream Errors:    {upstream_errors} sources "
+                  "(transient network/auth — verdict not demoted)")
+        if upstream_failed:
+            print(f"  Upstream Failed:    {upstream_failed}  "
+                  "(SBOM upstream claims do NOT match remote — REJECTED)")
+
     if args.scan:
         # Aggregate VEX-adjusted (actionable) counts across the fleet.
         total_crit = sum(r.vuln_critical for r in results)
@@ -2034,6 +2292,7 @@ def _write_on_disk_csv(
     customer_only: bool,
     attestations_on: bool,
     scan_on: bool,
+    upstream_on: bool = False,
 ) -> None:
     """Emit the detailed on-disk CSV (wider schema than the summary table).
 
@@ -2041,6 +2300,7 @@ def _write_on_disk_csv(
     - Base (always): image, digest, rekor fields, signature, verdict, error
     - Attestations: slsa_*, sbom_*, policy_*
     - Scan: vuln_*, vex_applied, kev_*
+    - Upstream: upstream_sources_*, upstream_failures
     - Freshness/FIPS (always): image_age_days, freshness_status, fips_variant
     """
     # Build header + per-row generators in lock-step so columns can't drift.
@@ -2079,6 +2339,12 @@ def _write_on_disk_csv(
         "vuln_low", "vuln_total", "vex_applied", "kev_status", "kev_count",
         "kev_cves",
     ]
+    upstream_headers = [
+        "upstream_sources_status", "upstream_sources_total",
+        "upstream_sources_verified", "upstream_sources_failed",
+        "upstream_sources_errors", "upstream_sources_skipped",
+        "upstream_failures",
+    ]
     tail_headers = ["image_age_days", "freshness_status", "fips_variant", "error"]
 
     def attest_cols(r: VerificationResult) -> list[object]:
@@ -2094,6 +2360,14 @@ def _write_on_disk_csv(
             r.kev_status, r.kev_count, _format_kev_hits(r.chain.kev_hits),
         ]
 
+    def upstream_cols(r: VerificationResult) -> list[object]:
+        return [
+            r.upstream_sources_status, r.upstream_sources_total,
+            r.upstream_sources_verified, r.upstream_sources_failed,
+            r.upstream_sources_errors, r.upstream_sources_skipped,
+            _format_upstream_failures(r.chain.upstream_summary),
+        ]
+
     def tail_cols(r: VerificationResult) -> list[object]:
         return [
             r.chain.image_age_days, r.freshness_status,
@@ -2105,6 +2379,8 @@ def _write_on_disk_csv(
         headers += attest_headers
     if scan_on:
         headers += scan_headers
+    if upstream_on:
+        headers += upstream_headers
     headers += tail_headers
 
     with open(csv_file, "w", newline="") as f:
@@ -2116,6 +2392,8 @@ def _write_on_disk_csv(
                 row += attest_cols(r)
             if scan_on:
                 row += scan_cols(r)
+            if upstream_on:
+                row += upstream_cols(r)
             row += tail_cols(r)
             writer.writerow(row)
 
@@ -2167,6 +2445,26 @@ def _fmt_age(r: VerificationResult) -> str:
     return age
 
 
+def _fmt_upstream(r: VerificationResult) -> str:
+    """Compact `<verified>/<countable> ✓` or `<verified>/<countable> (N failed)`.
+
+    `countable` excludes SKIP entries (no source info → not actually
+    verifiable). When N>0 sources erred (transient network) but none
+    failed, append a `?N` suffix so the auditor sees the gap.
+    """
+    if r.upstream_sources_status == "N/A":
+        return "N/A"
+    countable = r.upstream_sources_total - r.upstream_sources_skipped
+    if countable <= 0:
+        return "skip"
+    badge = f"{r.upstream_sources_verified}/{countable}"
+    if r.upstream_sources_failed:
+        return badge + f" ({r.upstream_sources_failed} failed)"
+    if r.upstream_sources_errors:
+        return badge + f" ?{r.upstream_sources_errors}"
+    return badge + " ✓"
+
+
 def _fmt_fips(r: VerificationResult) -> str:
     return "yes" if r.fips_variant else "no"
 
@@ -2174,6 +2472,7 @@ def _fmt_fips(r: VerificationResult) -> str:
 def _build_summary_columns(
     attestations_on: bool,
     scan_on: bool,
+    upstream_on: bool = False,
 ) -> list[tuple[str, str, "Callable[[VerificationResult], str]"]]:
     """Return (header, json_key, getter) tuples for the columns that apply
     to this run. Order matches the canonical table layout."""
@@ -2194,6 +2493,8 @@ def _build_summary_columns(
             ("VULN", "vuln", _fmt_vuln),
             ("KEV", "kev", _fmt_kev),
         ]
+    if upstream_on:
+        cols.append(("UPSTREAM", "upstream", _fmt_upstream))
     cols += [
         ("AGE", "age", _fmt_age),
         ("FIPS", "fips", _fmt_fips),
@@ -2205,10 +2506,11 @@ def _render_summary_table(
     results: list[VerificationResult],
     attestations_on: bool = True,
     scan_on: bool = True,
+    upstream_on: bool = False,
 ) -> str:
     """Render an ASCII table sized to content. Minimal dependencies — no rich,
     no tabulate. Plain stdlib."""
-    columns = _build_summary_columns(attestations_on, scan_on)
+    columns = _build_summary_columns(attestations_on, scan_on, upstream_on)
     headers = [c[0] for c in columns]
     rows = [[c[2](r) for c in columns] for r in results]
 
@@ -2233,6 +2535,11 @@ def _render_summary_table(
         legend.append(
             "          VULN  C/H/M/L counts; trailing * = OpenVEX adjudication applied"
         )
+    if upstream_on:
+        legend.append(
+            "          UPSTREAM verified/countable; (N failed) = SBOM "
+            "claim ≠ upstream; ?N = N transient errors"
+        )
     lines.append("")
     lines.extend(legend)
     return "\n".join(lines)
@@ -2256,6 +2563,9 @@ def _render_summary_json(
     """
     attestations_on = bool(args.verify_attestations)
     scan_on = bool(args.scan)
+    # Tolerant of older callers (tests build Namespace by hand without every
+    # newer flag). Treat missing attribute as the flag being off.
+    upstream_on = bool(getattr(args, "verify_upstream_sources", False))
 
     per_image = []
     for r in results:
@@ -2291,6 +2601,18 @@ def _render_summary_json(
                 "kev_status": r.kev_status,
                 "kev_count": r.kev_count,
             })
+        if upstream_on:
+            obj.update({
+                "upstream_sources_status": r.upstream_sources_status,
+                "upstream_sources_total": r.upstream_sources_total,
+                "upstream_sources_verified": r.upstream_sources_verified,
+                "upstream_sources_failed": r.upstream_sources_failed,
+                "upstream_sources_errors": r.upstream_sources_errors,
+                "upstream_sources_skipped": r.upstream_sources_skipped,
+                "upstream_failures": _format_upstream_failures(
+                    r.chain.upstream_summary
+                ),
+            })
         per_image.append(obj)
 
     out = {
@@ -2304,7 +2626,8 @@ def _render_summary_json(
             "rekor": True,
             "attestations": attestations_on,
             "scan": scan_on,
-            "sbom_drift": bool(args.sbom_drift),
+            "sbom_drift": bool(getattr(args, "sbom_drift", False)),
+            "upstream_sources": upstream_on,
         },
         "total": len(results),
         "verdict_counts": counts,
@@ -2318,11 +2641,12 @@ def _render_summary_csv(
     customer_only: bool,
     attestations_on: bool = True,
     scan_on: bool = True,
+    upstream_on: bool = False,
 ) -> str:
     """Same column gating as the summary table — when a check is off,
     its columns are dropped entirely rather than emitted as zeros or N/A."""
     import io
-    columns = _build_summary_columns(attestations_on, scan_on)
+    columns = _build_summary_columns(attestations_on, scan_on, upstream_on)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow([c[0] for c in columns])

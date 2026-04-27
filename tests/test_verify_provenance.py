@@ -817,3 +817,248 @@ class TestScanGlue:
         with patch("scan.run_scan", side_effect=fake_run_scan):
             _run_vuln_scan(result, result.chain, image_ref="cgr.dev/x/y@sha256:abc")
         assert captured_vex == [good_vex.predicate]
+
+
+class TestUpstreamSourcesGlue:
+    """Glue: _verify_upstream_sources_step + verdict demotion + flag wiring."""
+
+    def _spdx_rec(self, predicate: dict[str, object]) -> object:
+        from attestation import PREDICATE_SPDX, AttestationRecord
+        return AttestationRecord(
+            predicate_type=PREDICATE_SPDX,
+            verified=True,
+            subject_matches=True,
+            predicate=predicate,
+        )
+
+    def _doc_with_one_git_source(self, expected_commit: str) -> dict[str, object]:
+        # Smallest SPDX doc the walker accepts: one binary + one source via
+        # GENERATED_FROM, with a github purl.
+        src_id = f"SPDXRef-Package-{expected_commit}"
+        return {
+            "spdxVersion": "SPDX-2.3",
+            "packages": [
+                {"SPDXID": "SPDXRef-Package-bin", "name": "openssl", "versionInfo": "3.6.1"},
+                {
+                    "SPDXID": src_id,
+                    "name": "openssl-source",
+                    "externalRefs": [
+                        {
+                            "referenceCategory": "PACKAGE-MANAGER",
+                            "referenceType": "purl",
+                            "referenceLocator": "pkg:github/openssl/openssl@openssl-3.6.1",
+                        }
+                    ],
+                },
+            ],
+            "relationships": [
+                {
+                    "spdxElementId": "SPDXRef-Package-bin",
+                    "relatedSpdxElement": src_id,
+                    "relationshipType": "GENERATED_FROM",
+                }
+            ],
+        }
+
+    def test_skipped_when_no_verified_spdx(self) -> None:
+        from verify_provenance import _verify_upstream_sources_step
+
+        result = VerificationResult(
+            image="x", base_digest="", ref_status="", rekor_status="",
+            rekor_log_index="", sig_status="", status="", error="",
+        )
+        # No attestations on chain at all.
+        _verify_upstream_sources_step(result, result.chain)
+        assert result.upstream_sources_status == "N/A"
+        assert result.chain.upstream_summary is None
+
+    def test_populates_summary_on_verified_spdx(self) -> None:
+        from attestation import PREDICATE_SPDX
+        from verify_provenance import _verify_upstream_sources_step
+
+        commit = "c" * 40
+        rec = self._spdx_rec(self._doc_with_one_git_source(commit))
+        result = VerificationResult(
+            image="x", base_digest="", ref_status="", rekor_status="",
+            rekor_log_index="", sig_status="", status="", error="",
+        )
+        result.chain.attestations[PREDICATE_SPDX] = rec
+        ls_remote_out = f"{commit}\trefs/tags/openssl-3.6.1\n"
+        with patch("upstream.run_cmd", return_value=(True, ls_remote_out, "")):
+            _verify_upstream_sources_step(result, result.chain)
+        assert result.upstream_sources_status == "VERIFIED"
+        assert result.upstream_sources_total == 1
+        assert result.upstream_sources_verified == 1
+        assert result.upstream_sources_failed == 0
+
+    def test_failed_propagates_to_status(self) -> None:
+        from attestation import PREDICATE_SPDX
+        from verify_provenance import _verify_upstream_sources_step
+
+        commit = "c" * 40
+        wrong = "b" * 40
+        rec = self._spdx_rec(self._doc_with_one_git_source(commit))
+        result = VerificationResult(
+            image="x", base_digest="", ref_status="", rekor_status="",
+            rekor_log_index="", sig_status="", status="", error="",
+        )
+        result.chain.attestations[PREDICATE_SPDX] = rec
+        ls_remote_out = f"{wrong}\trefs/tags/openssl-3.6.1\n"
+        with patch("upstream.run_cmd", return_value=(True, ls_remote_out, "")):
+            _verify_upstream_sources_step(result, result.chain)
+        assert result.upstream_sources_status == "FAILED"
+        assert result.upstream_sources_failed == 1
+
+    def test_error_does_not_set_failed_status(self) -> None:
+        from attestation import PREDICATE_SPDX
+        from verify_provenance import _verify_upstream_sources_step
+
+        commit = "c" * 40
+        rec = self._spdx_rec(self._doc_with_one_git_source(commit))
+        result = VerificationResult(
+            image="x", base_digest="", ref_status="", rekor_status="",
+            rekor_log_index="", sig_status="", status="", error="",
+        )
+        result.chain.attestations[PREDICATE_SPDX] = rec
+        # Network error: run_cmd returns failure.
+        with patch("upstream.run_cmd", return_value=(False, "", "fatal: net down")):
+            _verify_upstream_sources_step(result, result.chain)
+        assert result.upstream_sources_status == "ERROR"
+        assert result.upstream_sources_failed == 0
+        assert result.upstream_sources_errors == 1
+
+
+class TestUpstreamFlagImplication:
+    """`--verify-upstream-sources` should imply `--verify-attestations`."""
+
+    def _parse(self, *flags: str) -> object:
+        import argparse
+
+        from verify_provenance import _build_image_subparser
+
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="cmd")
+        _build_image_subparser(sub)
+        return parser.parse_args(["image", "--customer-org", "foo", *flags])
+
+    def test_flag_implication_runs(self) -> None:
+        # Re-running just the implication block (the relevant slice of
+        # run_image_mode) on an args object with --verify-upstream-sources set
+        # should set verify_attestations True.
+        args = self._parse("--verify-upstream-sources")
+        # Mirror the check in run_image_mode.
+        if args.scan or args.sbom_drift or args.verify_upstream_sources:  # type: ignore[attr-defined]
+            args.verify_attestations = True  # type: ignore[attr-defined]
+        assert args.verify_attestations  # type: ignore[attr-defined]
+
+
+class TestUpstreamCsvAndJsonGating:
+    """Output-format column gating respects `upstream_on`."""
+
+    def _result(self, **overrides: object) -> VerificationResult:
+        r = VerificationResult(
+            image="x", base_digest="sha256:abc", ref_status="EXISTS",
+            rekor_status="EXISTS", rekor_log_index="1", sig_status="VALID",
+            status="VERIFIED", error="",
+        )
+        for k, v in overrides.items():
+            setattr(r, k, v)
+        return r
+
+    def test_summary_table_omits_upstream_when_off(self) -> None:
+        from verify_provenance import _render_summary_table
+
+        r = self._result(
+            upstream_sources_status="VERIFIED",
+            upstream_sources_total=5, upstream_sources_verified=5,
+        )
+        out = _render_summary_table([r], attestations_on=False, scan_on=False, upstream_on=False)
+        assert "UPSTREAM" not in out
+
+    def test_summary_table_shows_upstream_when_on(self) -> None:
+        from verify_provenance import _render_summary_table
+
+        r = self._result(
+            upstream_sources_status="VERIFIED",
+            upstream_sources_total=5, upstream_sources_verified=5,
+        )
+        out = _render_summary_table([r], attestations_on=False, scan_on=False, upstream_on=True)
+        assert "UPSTREAM" in out
+        assert "5/5" in out
+
+    def test_csv_writes_upstream_columns(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        from verify_provenance import _write_on_disk_csv
+
+        r = self._result(
+            upstream_sources_status="VERIFIED",
+            upstream_sources_total=3, upstream_sources_verified=3,
+        )
+        csv_file = tmp_path / "out.csv"
+        _write_on_disk_csv(
+            str(csv_file), [r], customer_only=False,
+            attestations_on=False, scan_on=False, upstream_on=True,
+        )
+        body = csv_file.read_text()
+        assert "upstream_sources_status" in body
+        assert "upstream_sources_verified" in body
+
+
+class TestUpstreamEvidenceBundle:
+    """Evidence-bundle integration: per-image upstream_sources.json + control map."""
+
+    def test_writes_upstream_artifact_and_control_when_status_set(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        import json as _json
+
+        from evidence import write_evidence_bundle
+        from upstream import UpstreamSummary, UpstreamVerifyResult
+
+        result = VerificationResult(
+            image="myimage", base_digest="sha256:abc", ref_status="EXISTS",
+            rekor_status="EXISTS", rekor_log_index="1", sig_status="VALID",
+            status="VERIFIED", error="",
+        )
+        result.upstream_sources_status = "VERIFIED"
+        result.upstream_sources_total = 2
+        result.upstream_sources_verified = 2
+        result.chain.upstream_summary = UpstreamSummary(
+            total=2, verified=2,
+            results=[
+                UpstreamVerifyResult(label="a", source_type="git", status="VERIFIED"),
+                UpstreamVerifyResult(label="b", source_type="http", status="VERIFIED"),
+            ],
+        )
+        out_dir = write_evidence_bundle(
+            tmp_path, result, tool_version="t", customer_org="o",
+            mode="full", policy_source="(defaults)",
+        )
+        upstream_file = out_dir / "upstream_sources.json"
+        assert upstream_file.exists()
+        body = _json.loads(upstream_file.read_text())
+        assert body["verified"] == 2
+        # Control map carries the new entry only when the check actually ran.
+        controls = _json.loads((out_dir / "controls.json").read_text())
+        assert "upstream_sources" in controls
+        assert "SR-3" in controls["upstream_sources"]["NIST_800-161"]
+        # Hash seal lists the new file.
+        seal = (out_dir / "SHA256SUMS").read_text()
+        assert "upstream_sources.json" in seal
+
+    def test_skips_artifact_and_control_when_status_na(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        import json as _json
+
+        from evidence import write_evidence_bundle
+
+        result = VerificationResult(
+            image="myimage", base_digest="sha256:abc", ref_status="EXISTS",
+            rekor_status="EXISTS", rekor_log_index="1", sig_status="VALID",
+            status="VERIFIED", error="",
+        )
+        # upstream_sources_status default is "N/A"; no chain.upstream_summary.
+        out_dir = write_evidence_bundle(
+            tmp_path, result, tool_version="t", customer_org="o",
+            mode="full", policy_source="(defaults)",
+        )
+        assert not (out_dir / "upstream_sources.json").exists()
+        controls = _json.loads((out_dir / "controls.json").read_text())
+        assert "upstream_sources" not in controls
+

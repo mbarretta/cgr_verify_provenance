@@ -76,6 +76,16 @@ CONTROL_MAP: dict[str, dict[str, list[str]]] = {
         "FIPS_140-3": ["variant-detected"],
         "FedRAMP_SR": ["SR-11"],
     },
+    # `--verify-upstream-sources` evidences supply-chain integrity by
+    # reaching upstream and confirming the SBOM's claims (tag→commit,
+    # tarball checksum) are real. SR-3 / SR-4 are the canonical mappings
+    # for "you actually verified the source you said you used"; SSDF PS.3
+    # covers provenance authenticity.
+    "upstream_sources": {
+        "SSDF": ["PS.3"],
+        "NIST_800-161": ["SR-3", "SR-4"],
+        "FedRAMP_SR": ["SR-3", "SR-4"],
+    },
 }
 
 
@@ -141,6 +151,12 @@ def write_evidence_bundle(
         "rekor_verified": result.chain.rekor_verified,
         "fips_variant": result.fips_variant,
         "fips_reason": result.fips_reason,
+        "upstream_sources_status": result.upstream_sources_status,
+        "upstream_sources_total": result.upstream_sources_total,
+        "upstream_sources_verified": result.upstream_sources_verified,
+        "upstream_sources_failed": result.upstream_sources_failed,
+        "upstream_sources_errors": result.upstream_sources_errors,
+        "upstream_sources_skipped": result.upstream_sources_skipped,
     }
     _write_json(img_dir / "metadata.json", meta)
 
@@ -161,6 +177,10 @@ def write_evidence_bundle(
     # 5) Policy violations
     if result.chain.policy_violations:
         _write_json(img_dir / "policy_violations.json", result.chain.policy_violations)
+
+    # 5b) Upstream source verification record (full per-source list)
+    if result.upstream_sources_status != "N/A" and result.chain.upstream_summary is not None:
+        _write_json(img_dir / "upstream_sources.json", result.chain.upstream_summary)
 
     # 6) Controls mapping — which frameworks each recorded check evidences.
     # Only include checks that actually ran (non-"N/A").
@@ -183,6 +203,8 @@ def write_evidence_bundle(
         relevant["freshness"] = CONTROL_MAP["freshness"]
     if result.fips_variant:
         relevant["fips"] = CONTROL_MAP["fips"]
+    if result.upstream_sources_status != "N/A":
+        relevant["upstream_sources"] = CONTROL_MAP["upstream_sources"]
     _write_json(img_dir / "controls.json", relevant)
 
     # 7) Human-readable summary
@@ -233,6 +255,19 @@ def _write_markdown_summary(path: Path, result: VerificationResult, meta: dict[s
         f"- Image age: {result.chain.image_age_days if result.chain.image_age_days >= 0 else 'unknown'} days",
         f"- Freshness: `{result.freshness_status}`",
         f"- FIPS variant: `{result.fips_variant}` {result.fips_reason}".rstrip(),
+    ]
+    if result.upstream_sources_status != "N/A":
+        countable = result.upstream_sources_total - result.upstream_sources_skipped
+        lines += [
+            "",
+            "## Upstream source verification",
+            f"- Status: `{result.upstream_sources_status}`",
+            f"- Verified: {result.upstream_sources_verified} / {countable}",
+            f"- Failed: {result.upstream_sources_failed}",
+            f"- Transient errors: {result.upstream_sources_errors}",
+            f"- Skipped (no source info): {result.upstream_sources_skipped}",
+        ]
+    lines += [
         "",
         "## Files in this bundle",
         "- `metadata.json` — top-level summary fields",
@@ -240,6 +275,7 @@ def _write_markdown_summary(path: Path, result: VerificationResult, meta: dict[s
         "- `scan.json` — full grype output (raw + VEX-adjusted)",
         "- `kev_hits.json` — CISA KEV entries matching actionable CVEs",
         "- `policy_violations.json` — allowlist failures (if any)",
+        "- `upstream_sources.json` — per-source git/tarball verification (if --verify-upstream-sources)",
         "- `controls.json` — map of checks to regulatory frameworks",
         "- `SHA256SUMS` — integrity-seal manifest for the bundle",
     ]

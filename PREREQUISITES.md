@@ -108,7 +108,31 @@ curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo
 
 **Documentation:** https://github.com/anchore/syft
 
-### 8. rekor-cli (Optional)
+### 8. git (Optional, for `--verify-upstream-sources`)
+
+Used by `--verify-upstream-sources` in image mode to confirm SBOM-asserted
+upstream coordinates by running `git ls-remote <repo> refs/tags/<tag>` and
+comparing the resolved commit hash to the SBOM. Almost always already
+installed on developer workstations.
+
+**Installation:**
+```bash
+# macOS
+brew install git
+
+# Debian/Ubuntu
+apt-get install git
+
+# RHEL/Fedora
+dnf install git
+```
+
+If your images include packages built from private `chainguard-dev/*`
+repositories, set one of `GITHUB_TOKEN` / `GH_TOKEN`, or run `gh auth
+login` first; the tool reads the token in that order and injects it into
+the `git ls-remote` URL so private tag lookups succeed.
+
+### 9. rekor-cli (Optional)
 
 Used for direct transparency log queries. The tool extracts Rekor data from signatures, but you can use rekor-cli for manual verification.
 

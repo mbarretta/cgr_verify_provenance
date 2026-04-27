@@ -25,6 +25,7 @@ The tool has two subcommands:
 | **Is this a FIPS variant?** | Detected from image name/tag (`-fips` suffix); surfaces "verify CMVP cert manually" reminder for the auditor |
 | **Who (in GitHub) built this image?** | Fulcio cert OID extensions surfaced from `cosign verify` output: workflow ref, commit SHA, trigger, run ID — for the public-registry build path |
 | **Does the attached SBOM describe the image I'm running?** (`--sbom-drift`) | Runs `syft` locally against the image, diffs the PURL set against the attested SBOM's PURL set. Catches registry-side SBOM-attestation substitution |
+| **Are the SBOM's upstream source claims real?** (`--verify-upstream-sources`) | Walks the verified SPDX SBOM's `relationships[]` + `externalRefs[]` purls; for each upstream, runs `git ls-remote <repo> refs/tags/<tag>` and matches the resolved commit against the SBOM's claimed commit, or downloads the tarball and matches its sha256/sha512 against the SBOM's `checksum` qualifier. Catches forged-but-cosigned SBOMs whose upstream coordinates do not exist |
 | **Can I verify without network?** (`--trusted-root`) | Accepts a Sigstore TUF `trusted_root.json` and passes it to all cosign invocations, enabling air-gapped verification |
 | **Give me the evidence, not just a green check** (`--evidence-bundle <dir>`) | Writes per-image subdirectory with every DSSE envelope, SBOM doc, grype output, KEV hits, policy eval, a Markdown summary, a control-mapping JSON (SSDF / NIST 800-161/190 / FedRAMP / CMMC / CISA BOD), and a SHA256SUMS seal |
 
@@ -192,6 +193,60 @@ based on signed metadata it can't trust.
 `--scan` implies `--verify-attestations` (we need the cryptographic VEX pull).
 Requires `grype` in `PATH`; see [PREREQUISITES.md](PREREQUISITES.md).
 
+### Image mode — Upstream source verification (optional)
+
+Add `--verify-upstream-sources` to walk the verified SPDX SBOM and confirm
+every upstream source actually matches what's at the upstream repo or
+tarball mirror. This is the supply-chain check that catches a
+forged-but-cosigned SBOM: even when cosign + Rekor + the in-toto subject
+match, an attacker could publish a signed SBOM that names a glibc commit
+upstream that doesn't exist. This flag closes that gap:
+
+```bash
+./verify_provenance.py image --customer-org your-org --verify-upstream-sources
+```
+
+For each package the tool resolves an upstream source from the SBOM's
+`relationships[]` + `externalRefs[]` purls (using `GENERATED_FROM` first,
+`DESCRIBED_BY` as fallback) and runs one of three checks:
+
+1. **`pkg:github/...` or `pkg:gitlab/...`** — `git ls-remote <repo>
+   refs/tags/<tag>` resolves the tag (annotated tags are dereferenced via
+   the `^{}` peel notation) and the resulting commit must match the
+   40-char hex hash embedded in the source-package SPDXID.
+2. **`pkg:generic/... + vcs_url=git+https://...@<commit>`** — same git
+   tag→commit check, with the expected commit pulled from the purl's
+   `vcs_url` qualifier.
+3. **`pkg:generic/... + download_url=... + checksum=sha256:...`** — the
+   tarball is streamed (no disk write) and its sha256/sha512 is matched
+   against the SBOM's `checksum` qualifier.
+
+Verdict policy:
+
+- **Any source FAILED** (real integrity mismatch) → overall verdict
+  demotes to `UPSTREAM_FAILED`. The CSV column `upstream_failures` lists
+  each failing package and the mismatch detail.
+- **Source ERRORED** (network timeout, DNS failure, auth required for a
+  private chainguard-dev repo) → surfaced in `upstream_sources_errors`
+  but does **not** demote the verdict. Same posture as the KEV-fetch
+  failure path.
+- **Source SKIPPED** (package has no source info — distro metadata,
+  melange-only, OCI layer entries) → silent; not counted as a failure.
+
+The check is opt-in because each image triggers ~25–50 upstream
+round-trips (one per package). A per-run cache shares lookups across
+images so the same APK package (glibc, openssl, ncurses) is queried only
+once even when dozens of images use it.
+
+`--verify-upstream-sources` implies `--verify-attestations` (we need a
+cryptographically verified SBOM upfront) and **cannot** be combined with
+`--trusted-root` (the upstream check is network-dependent by design — there
+is no air-gapped equivalent).
+
+For private `chainguard-dev/*` repos, set one of `GITHUB_TOKEN`,
+`GH_TOKEN`, or run `gh auth login`; the tool reads the token in that
+order. Public repos require no auth.
+
 ### CISA KEV Cross-Check (automatic with `--scan`)
 
 After the VEX-adjusted scan completes, each image's actionable CVE list is
@@ -224,6 +279,11 @@ verify-provenance image --customer-org ORG        Customer organization (require
                         --max-age-days N          Flag images older than N days as STALE
                         --trusted-root FILE       Offline / air-gap mode (Sigstore TUF root)
                         --sbom-drift              Run syft locally, diff against attested SBOM
+                        --verify-upstream-sources Walk SPDX SBOM, confirm every upstream source
+                                                  via `git ls-remote` (tag→commit) or tarball
+                                                  checksum. Implies --verify-attestations.
+                                                  Cannot combine with --trusted-root (network-
+                                                  dependent). Requires git in PATH.
                         --evidence-bundle DIR     Emit audit-grade per-image evidence directory
                         --csv-output FILE         Write full verification CSV to disk (else no file)
                         -v / --verbose            Print the full per-image verification chain
@@ -398,6 +458,13 @@ summary to stdout instead). The CSV columns are:
 - `kev_status` - `N/A`, `CLEAN`, or `HIT` for CISA KEV cross-check
 - `kev_count` - Number of actionable CVEs in the KEV catalog (unadjudicated)
 - `kev_cves` - Semicolon-separated list `CVE-ID(due=YYYY-MM-DD); …` per BOD 22-01
+- `upstream_sources_status` - `N/A` (check not run), `VERIFIED`, `FAILED`, or `ERROR` (transient — not verdict-demoting)
+- `upstream_sources_total` - Total sources walked from the SBOM
+- `upstream_sources_verified` - Sources confirmed against upstream
+- `upstream_sources_failed` - Sources whose SBOM claim disagrees with upstream (drives `UPSTREAM_FAILED` verdict)
+- `upstream_sources_errors` - Transient errors (network/auth) — not counted as failures
+- `upstream_sources_skipped` - Packages with no source coordinates in the SBOM (distro metadata, melange-only, OCI layers)
+- `upstream_failures` - Semicolon-separated `pkg-name(detail)` for each FAILED source
 - `error` - Error message if any
 
 ## Verification Statuses
@@ -411,6 +478,7 @@ summary to stdout instead). The CSV columns are:
 | `ATTESTATION_FAILED` | `--verify-attestations`: found a signed attestation but its in-toto subject digest describes a different image |
 | `POLICY_VIOLATION` | `--verify-attestations`: attestation verified but its SLSA builder.id or source URI is not on the configured allowlist |
 | `KEV_HIT` | `--scan`: image has one or more actionable (post-VEX) CVEs that appear in the CISA KEV catalog — hard-fail per BOD 22-01 guidance |
+| `UPSTREAM_FAILED` | `--verify-upstream-sources`: SBOM claims a tag→commit pair (or tarball checksum) that the upstream registry/repo disagrees with — hard-fail. Transient errors (`upstream_sources_status=ERROR`) do *not* trigger this verdict |
 | `NO_SIG` | No signature found on image |
 | `NO_BASE` | Image missing `org.opencontainers.image.base.digest` label |
 | `ERROR` | Verification failed |
