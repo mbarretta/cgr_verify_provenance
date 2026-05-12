@@ -132,7 +132,39 @@ repositories, set one of `GITHUB_TOKEN` / `GH_TOKEN`, or run `gh auth
 login` first; the tool reads the token in that order and injects it into
 the `git ls-remote` URL so private tag lookups succeed.
 
-### 9. rekor-cli (Optional)
+### 9. docker (Optional, for `build-deps`)
+
+Used to run `apk add --simulate` inside `cgr.dev/chainguard/wolfi-base` when
+enumerating an image's build-environment closure.
+
+**Installation:** Docker Desktop (macOS/Windows) or Docker Engine (Linux).
+On macOS the script bind-mounts files under `$TMPDIR`/`/tmp`; Docker Desktop
+typically allows this but may require `/private/tmp` in its file-sharing
+list. The script auto-resolves symlinks before mounting.
+
+### 10. yq (Optional, for `build-deps`)
+
+Used to extract `environment.contents.packages`, `pipeline.uses`, and `vars`
+blocks from melange recipe YAML.
+
+**Installation:**
+```bash
+# macOS/Linux (mikefarah/yq, the Go binary — not the Python yq)
+brew install yq
+```
+
+`build-deps` also requires a GitHub token authorized to read
+`chainguard-dev/stereo` — same env vars as `--verify-upstream-sources`.
+
+For `build-deps` against images whose recipes pull from private apk repos
+(e.g. FIPS images such as `cgr.dev/chainguard-private/mongodb-fips`),
+`chainctl auth login` must be active so the tool can mint a short-lived
+apk pull token via `chainctl auth token --audience apk.cgr.dev`. Without
+it, `build-deps` falls back to public-only resolution and reports the
+unresolvable packages in `errored_recipes`. Use `--no-private-apk` to
+opt out, or `--apk-org <name>` to point at a different tenant.
+
+### 11. rekor-cli (Optional)
 
 Used for direct transparency log queries. The tool extracts Rekor data from signatures, but you can use rekor-cli for manual verification.
 

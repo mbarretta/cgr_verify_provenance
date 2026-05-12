@@ -1,7 +1,7 @@
 .PHONY: help check-deps lint typecheck test clean demo-library
 
 PYTHON := python3
-SOURCES := verify_provenance.py verify_library.py
+SOURCES := verify_provenance.py verify_library.py build_env.py
 
 help:
 	@echo "Chainguard Provenance Verification"
@@ -20,6 +20,7 @@ help:
 	@echo "  ./verify_provenance.py library --parent-org YOUR_ORG \\"
 	@echo "      --ecosystem java --coordinate org.apache.commons:commons-compress:1.28.0 \\"
 	@echo "      --with-signatures"
+	@echo "  ./verify_provenance.py build-deps cgr.dev/YOUR_ORG/python:latest"
 
 check-deps:
 	@echo "Checking required dependencies..."

@@ -393,6 +393,93 @@ verify-provenance library --parent-org ORG         Parent org (required)
                           --limit N                Limit number of inputs processed
 ```
 
+### Build-deps mode — Enumerate the build environment
+
+The runtime SBOM attached to a Chainguard image lists everything that ends
+up *inside* the image. It does not list what was installed in the melange
+build sandbox to produce each apk. `build-deps` reconstructs that view:
+
+1. Fetch + verify the image's SPDX SBOM attestation (signature, in-toto
+   subject digest match — same posture as image mode).
+2. Pull every `*.yaml` recipe referenced in the SBOM's `packages[]` from
+   `chainguard-dev/stereo` at its pinned commit, using the GitHub
+   git-tree API to bulk-resolve paths.
+3. Walk each recipe's `pipeline.uses:` references and pull the matching
+   `pipelines/<name>.yaml` modules; union their `needs.packages`.
+4. Run `apk add --simulate` per recipe inside `cgr.dev/chainguard/wolfi-base`
+   to expand the declared set to its transitive closure.
+
+```bash
+# Human-readable summary
+./verify_provenance.py build-deps cgr.dev/<your-org>/python:latest
+
+# JSON for downstream tooling
+./verify_provenance.py build-deps cgr.dev/<your-org>/python:latest \
+    --format json | jq '.closure_names | length'
+
+# Per-(recipe, package) CSV for spreadsheet review
+./verify_provenance.py build-deps cgr.dev/<your-org>/python:latest \
+    --format csv --csv-output build-env.csv
+```
+
+**Requires** `docker` and `yq` in PATH, plus a GitHub token (env var
+`GITHUB_TOKEN` / `GH_TOKEN` or a `gh auth login` session) authorized to
+read `chainguard-dev/stereo`. Recipes that cannot be resolved at their
+pinned SHA are reported in `missing_recipes` and the command exits
+non-zero — there is no public-source fallback.
+
+**Private apk repo authentication.** Many Chainguard recipes (especially
+FIPS images) declare build-time deps that live in the *private* apk repo
+at `apk.cgr.dev/<org>` — `openssl-config-fipshardened`, FIPS NIST cert
+apks, `chainguard-baselayout`, `wolfi-baselayout`, etc. By default
+`build-deps` mints a short-lived apk pull token via
+`chainctl auth token --audience apk.cgr.dev` and configures the
+simulate container to resolve from `apk.cgr.dev/chainguard-private` in
+addition to the public repo, so those declared deps actually resolve.
+
+The token is passed to docker via `--env-file` (not on the command line),
+chmod 0o600, and never logged or written to the result JSON. `chainctl
+auth login` must be active for this to work — if it isn't, the tool
+warns and falls back to public-only resolution, surfacing any
+unresolvable packages in `errored_recipes` rather than failing silently.
+
+- `--apk-org <name>` — override the default `chainguard-private` org
+  (e.g. when your enterprise/FIPS apks live in a different tenant).
+- `--no-private-apk` — opt out entirely; resolve only against the
+  public apk repo (useful in environments without `chainctl`).
+- `--strict-closure` — exit 1 when any recipe's apk closure fails
+  (default: exit 0 with a warning, so partial closures don't break CI
+  unconditionally). Recipes whose declared deps couldn't be resolved
+  appear in `errored_recipes` with the offending package names.
+
+**Reproducibility caveat.** The closure is resolved against
+`apk.cgr.dev/chainguard`'s *current* state, not the apk repo as of the
+build timestamp. Package names are stable; transitive version pins drift
+as upstream apks publish new versions. A byte-identical replay of the
+historical build sandbox would additionally require (a) the resolved
+sandbox apk set with version pins (lives only in Chainguard's internal
+build-api logs today) and (b) a snapshot of the historical APKINDEX
+(retained internally but not exposed via `apk.cgr.dev`). Worth raising
+as a product gap if your audit requires it; for declared-deps inventory
+this tool is sufficient.
+
+### Build-deps mode options
+
+```
+verify-provenance build-deps IMAGE                Image reference (positional)
+                            --format {table|json|csv}
+                            --csv-output FILE      Per-(recipe,package) CSV
+                            --trusted-root FILE    Sigstore TUF root for offline verify
+                            --max-workers N        Parallel recipe fetches (default 8)
+                            --docker-timeout SEC   apk simulate timeout (default 600)
+                            --stereo-repo REPO     Override recipe repo (default chainguard-dev/stereo)
+                            --base-image REF       Override docker base (default cgr.dev/chainguard/wolfi-base)
+                            --apk-org NAME         Private apk repo org (default chainguard-private)
+                            --no-private-apk       Disable private apk auth (public repo only)
+                            --strict-closure       Exit 1 on partial apk closure
+                            -v, --verbose          Print per-recipe sizes
+```
+
 ## Output
 
 ### Terminal Output

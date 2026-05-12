@@ -36,12 +36,13 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import IO, TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from attestation import AttestationRecord
+    from build_env import BuildEnvResult
     from policy import IdentityPolicy, PolicyViolation
     from upstream import UpstreamVerifyResult
 
@@ -58,10 +59,14 @@ GITHUB_ACTIONS_ISSUER = "https://token.actions.githubusercontent.com"
 BASE_DIGEST_LABEL = "org.opencontainers.image.base.digest"
 
 
-def check_dependencies() -> list[str]:
-    """Check that required CLI tools are installed. Returns list of missing tools."""
+def check_dependencies(required: list[str] | None = None) -> list[str]:
+    """Check that required CLI tools are installed. Returns list of missing tools.
+
+    `required` defaults to REQUIRED_TOOLS (the image-mode set). Subcommands with
+    extra deps (e.g. build-deps needs docker + yq) pass an extended list.
+    """
     missing = []
-    for tool in REQUIRED_TOOLS:
+    for tool in required if required is not None else REQUIRED_TOOLS:
         if shutil.which(tool) is None:
             missing.append(tool)
     return missing
@@ -2727,6 +2732,323 @@ Examples:
                    help="Limit number of inputs processed (0 = all)")
 
 
+# ─────────────────────── build-deps subcommand ───────────────────────
+
+# Extra tools required by build-deps. yq parses melange recipes; docker
+# runs the apk add --simulate step. Image and library modes don't need
+# either, so we extend REQUIRED_TOOLS only when this subcommand runs.
+REQUIRED_TOOLS_BUILD_DEPS = REQUIRED_TOOLS + ["docker", "yq"]
+
+
+def _build_build_deps_subparser(
+    subparsers: "argparse._SubParsersAction[argparse.ArgumentParser]",
+) -> None:
+    p = subparsers.add_parser(
+        "build-deps",
+        help="Enumerate the transitive build-environment dependencies of an image.",
+        description=(
+            "Pull the image's SPDX SBOM attestation, resolve every referenced "
+            "melange recipe from chainguard-dev/stereo at its pinned commit, "
+            "walk pipeline.uses modules, and run `apk add --simulate` per "
+            "recipe inside cgr.dev/chainguard/wolfi-base to produce the "
+            "transitive build sandbox closure. Requires a GitHub token with "
+            "read access to chainguard-dev/stereo, plus docker + yq in PATH."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s cgr.dev/chainguard-private/mongodb-fips:latest
+      Print the build-env closure as a table.
+
+  %(prog)s cgr.dev/<org>/python:latest --format json | jq '.closure_names'
+      Pipe the per-package closure (names only) to jq.
+
+  %(prog)s cgr.dev/<org>/python:latest --format csv --csv-output build-env.csv
+      Write a per-(recipe,package) CSV.
+""",
+    )
+    p.add_argument("image", help="Image reference, e.g. cgr.dev/<org>/<image>:tag")
+    p.add_argument(
+        "--format",
+        choices=("json", "csv", "table"),
+        default="table",
+        help="Output format (table is human-readable; json/csv route progress to stderr).",
+    )
+    p.add_argument("--csv-output", help="Also write per-(recipe,package) rows to this CSV path.")
+    p.add_argument(
+        "--trusted-root",
+        help="Path to a Sigstore TUF trusted_root.json (offline cosign verify).",
+    )
+    p.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        help="Parallel recipe/pipeline-module fetches (default: 8).",
+    )
+    p.add_argument(
+        "--docker-timeout",
+        type=int,
+        default=600,
+        help="Seconds to wait for the docker simulate step (default: 600).",
+    )
+    p.add_argument(
+        "--stereo-repo",
+        default="chainguard-dev/stereo",
+        help="GitHub repo containing melange recipes (default: chainguard-dev/stereo).",
+    )
+    p.add_argument(
+        "--base-image",
+        default="cgr.dev/chainguard/wolfi-base",
+        help="Base image to run apk add --simulate inside.",
+    )
+    p.add_argument(
+        "--cache-dir",
+        default="",
+        help="Parent dir for the docker bind-mount tempdir (must be one "
+        "Docker Desktop can share). Default: ~/.cache/verify-provenance/build-deps.",
+    )
+    p.add_argument(
+        "--apk-org",
+        default="chainguard-private",
+        help="Org for the private apk repo (apk.cgr.dev/<org>). "
+        "Default: chainguard-private. Override when your enterprise/FIPS "
+        "apks live in a different tenant.",
+    )
+    p.add_argument(
+        "--no-private-apk",
+        action="store_true",
+        help="Skip private apk repo auth — resolve only against the public repo.",
+    )
+    p.add_argument(
+        "--strict-closure",
+        action="store_true",
+        help="Exit 1 when any recipe's apk closure fails (default: exit 0 with warning).",
+    )
+    p.add_argument("-v", "--verbose", action="store_true", help="Print per-recipe sizes.")
+
+
+def _print_build_deps_table(result: "BuildEnvResult", stream: IO[str]) -> None:
+    """Human-readable summary table. Mirrors the image-mode aesthetic."""
+    def _w(line: str = "") -> None:
+        print(line, file=stream)
+
+    _w(f"Image:               {result.image}")
+    if result.image_digest:
+        _w(f"Digest:              {result.image_digest}")
+    _w(f"Recipes referenced:  {len(result.recipes)}")
+    _w(f"Pipeline modules:    {result.pipeline_module_count}")
+    _w(f"Declared union:      {len(result.declared_union)}")
+    _w(f"Closure (names):     {len(result.closure_names)}")
+    _w(f"Closure (with pins): {len(result.closure_union)}")
+    _w(f"Private apk repo:    {result.private_apk_org or '(disabled)'}")
+    _w(f"Status:              {result.status}")
+    if result.error:
+        _w(f"Error:               {result.error}")
+    if result.missing_recipes:
+        _w("")
+        _w("Missing recipes:")
+        for m in result.missing_recipes:
+            _w(f"  - {m}")
+    if result.errored_recipes:
+        _w("")
+        _w("Errored recipes (apk could not resolve declared deps):")
+        for m in result.errored_recipes:
+            _w(f"  - {m}")
+
+
+def _print_build_deps_verbose(result: "BuildEnvResult", stream: IO[str]) -> None:
+    """Per-recipe declared+closure counts. Used with --verbose."""
+    def _w(line: str = "") -> None:
+        print(line, file=stream)
+
+    _w("")
+    _w(f"{'Recipe':<40} {'declared':>10} {'closure':>10} {'modules':>10}")
+    _w("-" * 72)
+    for r in result.recipes:
+        _w(
+            f"{r.name:<40} {len(r.declared_packages):>10} "
+            f"{len(r.closure):>10} {len(r.pipeline_modules):>10}"
+        )
+        if r.closure_error:
+            _w(f"  ! {r.closure_error}")
+
+
+def _write_build_deps_csv(result: "BuildEnvResult", path: str) -> None:
+    """Per-(recipe, package=version) rows. Includes a closure_error column so
+    errored recipes are visible even when their closure rows are empty."""
+    import csv
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["recipe", "commit_sha", "package", "version", "closure_error"])
+        for r in result.recipes:
+            if r.closure:
+                for entry in r.closure:
+                    name, _, version = entry.partition("=")
+                    w.writerow([r.name, r.commit_sha, name, version, r.closure_error])
+            elif r.closure_error:
+                # Surface errored-but-empty recipes as a single row.
+                w.writerow([r.name, r.commit_sha, "", "", r.closure_error])
+
+
+def run_build_deps_mode(args: argparse.Namespace) -> int:
+    """Driver for the build-deps subcommand. Returns process exit code."""
+    # Lazy imports keep image-mode startup unaffected.
+    from attestation import PREDICATE_SPDX, retrieve_and_verify_attestation
+    from build_env import BuildEnvError, enumerate_build_env
+
+    # json/csv reserve stdout for the machine-readable payload.
+    meta_stream = sys.stderr if args.format in ("json", "csv") else sys.stdout
+
+    def _meta(line: str = "") -> None:
+        print(line, file=meta_stream)
+
+    # 1. Required tools.
+    missing = check_dependencies(REQUIRED_TOOLS_BUILD_DEPS)
+    if missing:
+        print(f"Error: Missing required tools: {', '.join(missing)}", file=sys.stderr)
+        print("See PREREQUISITES.md for installation instructions.", file=sys.stderr)
+        return 1
+
+    # 2. GitHub token (env, then `gh auth token`).
+    from upstream import github_token
+
+    token = github_token()
+    if not token:
+        print(
+            "Error: no GitHub token available. Set GITHUB_TOKEN or run "
+            "`gh auth login` (need read access to chainguard-dev/stereo).",
+            file=sys.stderr,
+        )
+        return 1
+
+    # 3. Resolve the per-platform image digest. Chainguard publishes one
+    #    SPDX SBOM per platform — the one attached to the multi-arch index
+    #    digest is just a 3-package wrapper that doesn't list recipe yamls.
+    #    Pinning the cosign image_ref to the per-platform digest selects
+    #    the right SBOM and makes the in-toto subject-digest check pass.
+    _meta(f"Resolving linux/amd64 digest for {args.image} ...")
+    ok, digest, err = run_cmd(["crane", "digest", "--platform", "linux/amd64", args.image])
+    if not ok:
+        print(f"Error: crane digest failed: {err.strip()}", file=sys.stderr)
+        return 1
+    image_digest = digest.strip()
+    # Strip any :tag from the original ref and re-pin to the resolved digest.
+    base_ref = args.image.split("@", 1)[0]
+    if ":" in base_ref.rsplit("/", 1)[-1]:
+        base_ref = base_ref.rsplit(":", 1)[0]
+    pinned_ref = f"{base_ref}@{image_digest}"
+
+    # 4. Fetch + verify the SPDX SBOM attestation against the pinned per-platform image.
+    from policy import default_build_policy
+
+    pol = default_build_policy()
+    _meta("Verifying SPDX SBOM attestation ...")
+    rec = retrieve_and_verify_attestation(
+        image_ref=pinned_ref,
+        image_digest=image_digest,
+        predicate_type=PREDICATE_SPDX,
+        oidc_issuer_regex=pol.cosign_oidc_issuer_regex,
+        identity_regex=pol.cosign_identity_regex,
+        trusted_root=args.trusted_root,
+    )
+    if not rec.verified:
+        print(f"Error: SPDX attestation failed cosign verify: {rec.error}", file=sys.stderr)
+        return 1
+    if not rec.subject_matches:
+        print(
+            f"Error: SPDX attestation subject digest did not match image digest "
+            f"(observed: {rec.subject_digests})",
+            file=sys.stderr,
+        )
+        return 1
+    if not rec.predicate:
+        print("Error: SPDX attestation predicate is empty", file=sys.stderr)
+        return 1
+
+    # 5. Acquire the apk pull token via chainctl so the simulate container
+    #    can resolve packages from the private apk repo (where enterprise/FIPS
+    #    apks live). Non-fatal: if chainctl isn't authenticated, fall back to
+    #    public-only and let the per-recipe errors surface what couldn't resolve.
+    apk_token = ""
+    apk_org = ""
+    if not args.no_private_apk:
+        apk_org = args.apk_org
+        _meta(f"Requesting apk pull token for {apk_org} ...")
+        ok, tok, err = run_cmd(
+            ["chainctl", "auth", "token", "--audience", "apk.cgr.dev"],
+            timeout=15,
+        )
+        if ok:
+            apk_token = tok.strip()
+        else:
+            _meta(
+                f"Warning: chainctl auth token failed "
+                f"({err.strip() or 'unknown'}); falling back to public apk repo only."
+            )
+            apk_org = ""  # don't pass an org without a token
+
+    # 6. Enumerate.
+    _meta("Resolving recipes from chainguard-dev/stereo ...")
+    try:
+        result = enumerate_build_env(
+            image_ref=args.image,
+            image_digest=image_digest,
+            sbom_predicate=rec.predicate,
+            github_token=token,
+            repo=args.stereo_repo,
+            base_image=args.base_image,
+            max_workers=args.max_workers,
+            docker_timeout=args.docker_timeout,
+            tmp_root=args.cache_dir or None,
+            apk_token=apk_token,
+            private_apk_org=apk_org,
+        )
+    except BuildEnvError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    # 7. Output.
+    if args.format == "json":
+        # Manual asdict so we get plain dicts for nested dataclasses.
+        from dataclasses import asdict
+
+        json.dump(asdict(result), sys.stdout, indent=2)
+        print()
+    elif args.format == "csv":
+        # Pipe per-(recipe,package) rows to stdout; --csv-output also writes
+        # a file when requested.
+        import csv
+
+        w = csv.writer(sys.stdout)
+        w.writerow(["recipe", "commit_sha", "package", "version", "closure_error"])
+        for r in result.recipes:
+            if r.closure:
+                for entry in r.closure:
+                    name, _, version = entry.partition("=")
+                    w.writerow([r.name, r.commit_sha, name, version, r.closure_error])
+            elif r.closure_error:
+                w.writerow([r.name, r.commit_sha, "", "", r.closure_error])
+    else:
+        _print_build_deps_table(result, sys.stdout)
+        if args.verbose:
+            _print_build_deps_verbose(result, sys.stdout)
+
+    if args.csv_output:
+        _write_build_deps_csv(result, args.csv_output)
+        _meta(f"Wrote per-recipe CSV to {args.csv_output}")
+
+    # Exit codes:
+    #   OK                  -> 0
+    #   CLOSURE_INCOMPLETE  -> 0 by default; 1 with --strict-closure
+    #   anything else       -> 1 (MISSING_RECIPES, DOCKER_FAILED, SBOM_EMPTY)
+    if result.status == "OK":
+        return 0
+    if result.status == "CLOSURE_INCOMPLETE":
+        return 1 if args.strict_closure else 0
+    return 1
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="verify-provenance",
@@ -2734,9 +3056,12 @@ def main() -> None:
                     "libraries (libraries.cgr.dev).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="cmd", required=True, metavar="{image,library}")
+    subparsers = parser.add_subparsers(
+        dest="cmd", required=True, metavar="{image,library,build-deps}"
+    )
     _build_image_subparser(subparsers)
     _build_library_subparser(subparsers)
+    _build_build_deps_subparser(subparsers)
 
     args = parser.parse_args()
 
@@ -2746,6 +3071,8 @@ def main() -> None:
         # Lazy import so image mode doesn't pay for it
         from verify_library import run_library_mode
         sys.exit(run_library_mode(args))
+    elif args.cmd == "build-deps":
+        sys.exit(run_build_deps_mode(args))
 
 
 if __name__ == "__main__":
