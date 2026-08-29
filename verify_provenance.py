@@ -34,6 +34,8 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import IO, TYPE_CHECKING, Optional
@@ -2765,9 +2767,47 @@ Examples:
 
   %(prog)s cgr.dev/<org>/python:latest --format csv --csv-output build-env.csv
       Write a per-(recipe,package) CSV.
+
+  %(prog)s --customer-org chainguard-private --output-dir ./build-deps-out
+      Enumerate build-env closures for every image in the org, with bounded
+      outer concurrency. Stdout shows a fleet summary; per-image detail lands
+      in --output-dir.
 """,
     )
-    p.add_argument("image", help="Image reference, e.g. cgr.dev/<org>/<image>:tag")
+    p.add_argument(
+        "image",
+        nargs="?",
+        help="Image reference, e.g. cgr.dev/<org>/<image>:tag. Omit when --customer-org is set.",
+    )
+    p.add_argument(
+        "--customer-org",
+        help="Run build-deps across every image in this Chainguard customer org. "
+        "Mutually exclusive with the `image` positional.",
+    )
+    p.add_argument(
+        "--image-workers",
+        type=int,
+        default=2,
+        help="Outer concurrency for --customer-org batch mode: number of images "
+        "processed in parallel. Each worker spawns its own docker container "
+        "(default: 2).",
+    )
+    p.add_argument(
+        "--output-dir",
+        help="In --customer-org mode, write per-image <image>.json plus "
+        "_fleet-summary.json under this directory.",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="In --customer-org mode, only process the first N images (0 = no limit).",
+    )
+    p.add_argument(
+        "--tag",
+        default="latest",
+        help="In --customer-org mode, the tag to verify on each image (default: latest).",
+    )
     p.add_argument(
         "--format",
         choices=("json", "csv", "table"),
@@ -2891,17 +2931,352 @@ def _write_build_deps_csv(result: "BuildEnvResult", path: str) -> None:
                 w.writerow([r.name, r.commit_sha, "", "", r.closure_error])
 
 
+# ─────────────────────── --customer-org fleet output ───────────────────────
+
+
+def _build_deps_status_counts(results: list["BuildEnvResult"]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    return counts
+
+
+def _print_build_deps_fleet_table(
+    customer_org: str,
+    tag: str,
+    results: list["BuildEnvResult"],
+    stream: IO[str],
+) -> None:
+    """Compact per-image table + fleet counts. Stream-aware so we can target
+    sys.stdout in table mode or an explicit file."""
+    def _w(line: str = "") -> None:
+        print(line, file=stream)
+
+    name_width = max((len(r.image.rsplit("/", 1)[-1]) for r in results), default=20)
+    name_width = max(20, min(name_width, 50))
+    header = (
+        f"{'Image':<{name_width}}  {'Recipes':>7}  {'Closure':>7}  "
+        f"{'Errored':>7}  Status"
+    )
+    _w(header)
+    _w("-" * len(header))
+    for r in results:
+        short = r.image.rsplit("/", 1)[-1]
+        _w(
+            f"{short:<{name_width}}  {len(r.recipes):>7}  "
+            f"{len(r.closure_names):>7}  {len(r.errored_recipes):>7}  {r.status}"
+        )
+
+    counts = _build_deps_status_counts(results)
+    _w("")
+    _w("═" * 78)
+    _w("  BUILD-DEPS FLEET SUMMARY")
+    _w("═" * 78)
+    _w(f"  Customer Org:         {customer_org}")
+    _w(f"  Tag:                  {tag}")
+    _w(f"  Total Images:         {len(results)}")
+    for status in (
+        "OK",
+        "CLOSURE_INCOMPLETE",
+        "MISSING_RECIPES",
+        "DOCKER_FAILED",
+        "SBOM_EMPTY",
+        "ERROR",
+        "SKIPPED",
+    ):
+        if counts.get(status):
+            _w(f"  {status:<22}{counts[status]}")
+    _w("═" * 78)
+
+
+def _write_build_deps_fleet_csv_stream(
+    results: list["BuildEnvResult"],
+    stream: IO[str],
+) -> None:
+    """Per-(image, recipe, package=version) rows. Same shape as the single-image
+    CSV with a leading `image` column."""
+    w = csv.writer(stream)
+    w.writerow(["image", "recipe", "commit_sha", "package", "version", "closure_error", "status"])
+    for r in results:
+        if not r.recipes and r.error:
+            w.writerow([r.image, "", "", "", "", r.error, r.status])
+            continue
+        for rec in r.recipes:
+            if rec.closure:
+                for entry in rec.closure:
+                    name, _, version = entry.partition("=")
+                    w.writerow(
+                        [r.image, rec.name, rec.commit_sha, name, version, rec.closure_error, r.status]
+                    )
+            elif rec.closure_error:
+                w.writerow(
+                    [r.image, rec.name, rec.commit_sha, "", "", rec.closure_error, r.status]
+                )
+
+
+def _write_build_deps_output_dir(
+    out_dir: "Path",
+    results: list["BuildEnvResult"],
+    customer_org: str,
+    tag: str,
+) -> None:
+    """Write one <image>.json per result plus _fleet-summary.json."""
+    from dataclasses import asdict
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for r in results:
+        short = r.image.rsplit("/", 1)[-1].split(":", 1)[0]
+        (out_dir / f"{short}.json").write_text(
+            json.dumps(asdict(r), indent=2)
+        )
+    summary = {
+        "customer_org": customer_org,
+        "tag": tag,
+        "total": len(results),
+        "status_counts": _build_deps_status_counts(results),
+        "non_ok_images": [
+            {"image": r.image, "status": r.status, "error": r.error}
+            for r in results
+            if r.status != "OK"
+        ],
+    }
+    (out_dir / "_fleet-summary.json").write_text(json.dumps(summary, indent=2))
+
+
+def _build_deps_exit_code(status: str, strict_closure: bool) -> int:
+    """Map a single BuildEnvResult.status to a process exit code.
+    OK / SKIPPED          -> 0
+    CLOSURE_INCOMPLETE    -> 0 (or 1 with --strict-closure)
+    anything else         -> 1
+    """
+    if status in ("OK", "SKIPPED"):
+        return 0
+    if status == "CLOSURE_INCOMPLETE":
+        return 1 if strict_closure else 0
+    return 1
+
+
+def _is_image_not_found(err_text: str) -> bool:
+    """Detect crane's various 'image doesn't exist / not entitled' errors.
+    Used to distinguish a customer image with no chainguard-private mirror
+    (SKIPPED) from a real verification failure (ERROR).
+    """
+    lowered = err_text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "forbidden",
+            "manifest_unknown",
+            "name_unknown",
+            "not found",
+            "denied",
+            "unauthorized",
+        )
+    )
+
+
+# ─── chainctl session-token refresh for long --customer-org batches ───
+# chainctl mints short-lived tokens (~5 min). A 25-image batch can run well
+# past one TTL, after which cosign-verify gets UNAUTHORIZED from cgr.dev
+# even though the user's chainctl session is still valid. Re-running
+# `chainctl auth token` mints a fresh one and updates the docker credential
+# helper's cache that cosign reads.
+_chainctl_refresh_lock = threading.Lock()
+_chainctl_last_refresh: float = 0.0
+
+
+def _is_cosign_auth_failure(err_text: str) -> bool:
+    """True when cosign's failure looks like an expired chainctl token
+    rather than a real authz problem."""
+    return "unauthorized: authentication required" in (err_text or "").lower()
+
+
+def _refresh_chainctl_session(meta: "Callable[[str], None] | None") -> None:
+    """Mint a fresh cgr.dev-scoped chainctl token so the docker credential
+    helper stops serving stale creds. Debounced: when multiple workers hit
+    UNAUTHORIZED at once, only the first triggers the actual refresh.
+    """
+    global _chainctl_last_refresh
+    with _chainctl_refresh_lock:
+        now = time.monotonic()
+        if now - _chainctl_last_refresh < 30.0:
+            return
+        if meta is not None:
+            meta("Refreshing chainctl session token (cosign got UNAUTHORIZED) ...")
+        run_cmd(["chainctl", "auth", "token", "--audience", "cgr.dev"], timeout=30)
+        _chainctl_last_refresh = now
+
+
+def _build_deps_for_image(
+    image_ref: str,
+    *,
+    github_token: str,
+    apk_token: str,
+    apk_org: str,
+    pol: "IdentityPolicy",
+    args: argparse.Namespace,
+    inner_workers: int,
+    tree_cache: "dict[str, dict[str, str]] | None" = None,
+    tree_lock: "object | None" = None,
+    meta: "Callable[[str], None] | None" = None,
+    display_image_ref: str = "",
+) -> "BuildEnvResult":
+    """Run the build-deps pipeline for one image and return a BuildEnvResult.
+
+    Infrastructure failures (crane/cosign/BuildEnvError) are captured as a
+    synthetic result with status="ERROR" so a batch run can keep going. The
+    single-image caller checks for that status itself when deciding to print
+    an Error: line to stderr.
+
+    `tree_cache` / `tree_lock` may be shared across multiple per-image calls
+    in batch mode to dedupe GitHub git-tree lookups across images that pin
+    the same stereo SHA.
+
+    `display_image_ref`, when set, replaces `result.image` in the returned
+    BuildEnvResult while the actual ref used for crane/cosign/enumerate is
+    recorded in `result.source_image_ref`. The batch path uses this to
+    rewrite customer-org refs to chainguard-private (where build attestations
+    live) while keeping the customer-facing ref in output.
+    """
+    from attestation import PREDICATE_SPDX, retrieve_and_verify_attestation
+    from build_env import BuildEnvError, BuildEnvResult, enumerate_build_env
+
+    visible_ref = display_image_ref or image_ref
+    rewrote = bool(display_image_ref) and display_image_ref != image_ref
+
+    def _err(msg: str) -> "BuildEnvResult":
+        r = BuildEnvResult(image=visible_ref, status="ERROR", error=msg)
+        if rewrote:
+            r.source_image_ref = image_ref
+        return r
+
+    if meta is not None:
+        meta(f"Resolving linux/amd64 digest for {image_ref} ...")
+    # Bumped from the run_cmd default of 30s: under --customer-org with
+    # --image-workers > 1, concurrent crane invocations all hit chainctl's
+    # credential helper, which serializes token I/O and can spike a single
+    # digest call past 30s on a cold session.
+    ok, digest, err = run_cmd(
+        ["crane", "digest", "--platform", "linux/amd64", image_ref],
+        timeout=120,
+    )
+    if not ok:
+        err_text = err.strip()
+        # In batch mode (customer→source rewrite) a missing image is a real
+        # "this customer-built image has no chainguard-private mirror" and
+        # shouldn't fail the run. In single-image mode the user typed the ref
+        # explicitly, so a 404 is still an ERROR.
+        if rewrote and _is_image_not_found(err_text):
+            r = BuildEnvResult(
+                image=visible_ref,
+                status="SKIPPED",
+                error=f"image not present in source org: {err_text}",
+                source_image_ref=image_ref,
+            )
+            return r
+        return _err(f"crane digest failed: {err_text}")
+    image_digest = digest.strip()
+    # Strip any :tag from the original ref and re-pin to the resolved digest.
+    base_ref = image_ref.split("@", 1)[0]
+    if ":" in base_ref.rsplit("/", 1)[-1]:
+        base_ref = base_ref.rsplit(":", 1)[0]
+    pinned_ref = f"{base_ref}@{image_digest}"
+
+    if meta is not None:
+        meta(f"Verifying SPDX SBOM attestation for {image_ref} ...")
+    # Same chainctl-auth-contention story as crane digest above: when N images
+    # cosign-verify in parallel they all queue on chainctl's token helper, and
+    # the function's 60s default can be the tightest waist. Match the crane
+    # 120s budget.
+    def _verify() -> "AttestationRecord":
+        return retrieve_and_verify_attestation(
+            image_ref=pinned_ref,
+            image_digest=image_digest,
+            predicate_type=PREDICATE_SPDX,
+            oidc_issuer_regex=pol.cosign_oidc_issuer_regex,
+            identity_regex=pol.cosign_identity_regex,
+            trusted_root=args.trusted_root,
+            timeout=120,
+        )
+
+    rec = _verify()
+    # Token-expiry retry: long batches outlive a single chainctl session.
+    # Refresh once, retry once. Failures past that surface as ERROR.
+    if not rec.verified and _is_cosign_auth_failure(rec.error or ""):
+        _refresh_chainctl_session(meta)
+        rec = _verify()
+    if not rec.verified:
+        return _err(f"SPDX attestation failed cosign verify: {rec.error}")
+    if not rec.subject_matches:
+        return _err(
+            f"SPDX attestation subject digest did not match image digest "
+            f"(observed: {rec.subject_digests})"
+        )
+    if not rec.predicate:
+        return _err("SPDX attestation predicate is empty")
+
+    try:
+        result = enumerate_build_env(
+            image_ref=image_ref,
+            image_digest=image_digest,
+            sbom_predicate=rec.predicate,
+            github_token=github_token,
+            repo=args.stereo_repo,
+            base_image=args.base_image,
+            max_workers=inner_workers,
+            docker_timeout=args.docker_timeout,
+            tmp_root=args.cache_dir or None,
+            apk_token=apk_token,
+            private_apk_org=apk_org,
+            tree_cache=tree_cache,
+            tree_lock=tree_lock,
+        )
+    except BuildEnvError as e:
+        return _err(str(e))
+    if rewrote:
+        result.source_image_ref = image_ref
+        result.image = visible_ref
+    return result
+
+
+def _acquire_apk_token(args: argparse.Namespace, meta: "Callable[[str], None]") -> tuple[str, str]:
+    """Acquire the chainctl apk pull token shared across the run.
+    Returns (apk_token, apk_org). Non-fatal: falls back to public-only with a
+    warning when chainctl isn't authenticated.
+    """
+    if args.no_private_apk:
+        return "", ""
+    apk_org = args.apk_org
+    meta(f"Requesting apk pull token for {apk_org} ...")
+    ok, tok, err = run_cmd(
+        ["chainctl", "auth", "token", "--audience", "apk.cgr.dev"],
+        timeout=15,
+    )
+    if ok:
+        return tok.strip(), apk_org
+    meta(
+        f"Warning: chainctl auth token failed "
+        f"({err.strip() or 'unknown'}); falling back to public apk repo only."
+    )
+    return "", ""
+
+
 def run_build_deps_mode(args: argparse.Namespace) -> int:
     """Driver for the build-deps subcommand. Returns process exit code."""
-    # Lazy imports keep image-mode startup unaffected.
-    from attestation import PREDICATE_SPDX, retrieve_and_verify_attestation
-    from build_env import BuildEnvError, enumerate_build_env
-
     # json/csv reserve stdout for the machine-readable payload.
     meta_stream = sys.stderr if args.format in ("json", "csv") else sys.stdout
 
     def _meta(line: str = "") -> None:
         print(line, file=meta_stream)
+
+    # Mutual exclusion: exactly one of {image, --customer-org}.
+    if (args.image is None) == (args.customer_org is None):
+        print(
+            "Error: must specify exactly one of `image` (positional) or "
+            "`--customer-org <org>`.",
+            file=sys.stderr,
+        )
+        return 2
 
     # 1. Required tools.
     missing = check_dependencies(REQUIRED_TOOLS_BUILD_DEPS)
@@ -2922,104 +3297,40 @@ def run_build_deps_mode(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # 3. Resolve the per-platform image digest. Chainguard publishes one
-    #    SPDX SBOM per platform — the one attached to the multi-arch index
-    #    digest is just a 3-package wrapper that doesn't list recipe yamls.
-    #    Pinning the cosign image_ref to the per-platform digest selects
-    #    the right SBOM and makes the in-toto subject-digest check pass.
-    _meta(f"Resolving linux/amd64 digest for {args.image} ...")
-    ok, digest, err = run_cmd(["crane", "digest", "--platform", "linux/amd64", args.image])
-    if not ok:
-        print(f"Error: crane digest failed: {err.strip()}", file=sys.stderr)
-        return 1
-    image_digest = digest.strip()
-    # Strip any :tag from the original ref and re-pin to the resolved digest.
-    base_ref = args.image.split("@", 1)[0]
-    if ":" in base_ref.rsplit("/", 1)[-1]:
-        base_ref = base_ref.rsplit(":", 1)[0]
-    pinned_ref = f"{base_ref}@{image_digest}"
-
-    # 4. Fetch + verify the SPDX SBOM attestation against the pinned per-platform image.
+    # 3. Build policy + apk token (acquired once, shared across every per-image call).
     from policy import default_build_policy
 
     pol = default_build_policy()
-    _meta("Verifying SPDX SBOM attestation ...")
-    rec = retrieve_and_verify_attestation(
-        image_ref=pinned_ref,
-        image_digest=image_digest,
-        predicate_type=PREDICATE_SPDX,
-        oidc_issuer_regex=pol.cosign_oidc_issuer_regex,
-        identity_regex=pol.cosign_identity_regex,
-        trusted_root=args.trusted_root,
+    apk_token, apk_org = _acquire_apk_token(args, _meta)
+
+    # Dispatch.
+    if args.customer_org is not None:
+        return _run_build_deps_batch(
+            args, token=token, apk_token=apk_token, apk_org=apk_org, pol=pol, meta=_meta
+        )
+
+    # Single-image path (regression of the prior behavior).
+    result = _build_deps_for_image(
+        args.image,
+        github_token=token,
+        apk_token=apk_token,
+        apk_org=apk_org,
+        pol=pol,
+        args=args,
+        inner_workers=args.max_workers,
+        meta=_meta,
     )
-    if not rec.verified:
-        print(f"Error: SPDX attestation failed cosign verify: {rec.error}", file=sys.stderr)
-        return 1
-    if not rec.subject_matches:
-        print(
-            f"Error: SPDX attestation subject digest did not match image digest "
-            f"(observed: {rec.subject_digests})",
-            file=sys.stderr,
-        )
-        return 1
-    if not rec.predicate:
-        print("Error: SPDX attestation predicate is empty", file=sys.stderr)
+    if result.status == "ERROR":
+        print(f"Error: {result.error}", file=sys.stderr)
         return 1
 
-    # 5. Acquire the apk pull token via chainctl so the simulate container
-    #    can resolve packages from the private apk repo (where enterprise/FIPS
-    #    apks live). Non-fatal: if chainctl isn't authenticated, fall back to
-    #    public-only and let the per-recipe errors surface what couldn't resolve.
-    apk_token = ""
-    apk_org = ""
-    if not args.no_private_apk:
-        apk_org = args.apk_org
-        _meta(f"Requesting apk pull token for {apk_org} ...")
-        ok, tok, err = run_cmd(
-            ["chainctl", "auth", "token", "--audience", "apk.cgr.dev"],
-            timeout=15,
-        )
-        if ok:
-            apk_token = tok.strip()
-        else:
-            _meta(
-                f"Warning: chainctl auth token failed "
-                f"({err.strip() or 'unknown'}); falling back to public apk repo only."
-            )
-            apk_org = ""  # don't pass an org without a token
-
-    # 6. Enumerate.
-    _meta("Resolving recipes from chainguard-dev/stereo ...")
-    try:
-        result = enumerate_build_env(
-            image_ref=args.image,
-            image_digest=image_digest,
-            sbom_predicate=rec.predicate,
-            github_token=token,
-            repo=args.stereo_repo,
-            base_image=args.base_image,
-            max_workers=args.max_workers,
-            docker_timeout=args.docker_timeout,
-            tmp_root=args.cache_dir or None,
-            apk_token=apk_token,
-            private_apk_org=apk_org,
-        )
-    except BuildEnvError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-
-    # 7. Output.
+    # Output.
     if args.format == "json":
-        # Manual asdict so we get plain dicts for nested dataclasses.
         from dataclasses import asdict
 
         json.dump(asdict(result), sys.stdout, indent=2)
         print()
     elif args.format == "csv":
-        # Pipe per-(recipe,package) rows to stdout; --csv-output also writes
-        # a file when requested.
-        import csv
-
         w = csv.writer(sys.stdout)
         w.writerow(["recipe", "commit_sha", "package", "version", "closure_error"])
         for r in result.recipes:
@@ -3038,15 +3349,144 @@ def run_build_deps_mode(args: argparse.Namespace) -> int:
         _write_build_deps_csv(result, args.csv_output)
         _meta(f"Wrote per-recipe CSV to {args.csv_output}")
 
-    # Exit codes:
-    #   OK                  -> 0
-    #   CLOSURE_INCOMPLETE  -> 0 by default; 1 with --strict-closure
-    #   anything else       -> 1 (MISSING_RECIPES, DOCKER_FAILED, SBOM_EMPTY)
-    if result.status == "OK":
-        return 0
-    if result.status == "CLOSURE_INCOMPLETE":
-        return 1 if args.strict_closure else 0
-    return 1
+    return _build_deps_exit_code(result.status, args.strict_closure)
+
+
+def _run_build_deps_batch(
+    args: argparse.Namespace,
+    *,
+    token: str,
+    apk_token: str,
+    apk_org: str,
+    pol: "IdentityPolicy",
+    meta: "Callable[[str], None]",
+) -> int:
+    """Run build-deps over every image in args.customer_org with bounded outer
+    concurrency. Per-image failures don't abort the batch.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from build_env import BuildEnvResult
+
+    # chainctl auth gate (mirrors image-mode at verify_provenance.py:1978).
+    ok, _, _ = run_cmd(["chainctl", "auth", "status"], timeout=10)
+    if not ok:
+        print("Error: Not authenticated. Run 'chainctl auth login'", file=sys.stderr)
+        return 1
+
+    meta(f"Fetching entitled images for '{args.customer_org}'...")
+    short_names = get_image_list(args.customer_org)
+    if not short_names:
+        print("Error: Could not retrieve image list", file=sys.stderr)
+        return 1
+    meta(f"Found {len(short_names)} images")
+
+    if args.limit > 0:
+        short_names = short_names[: args.limit]
+        meta(f"Limited to first {args.limit} images")
+
+    # Customer-delivery orgs (e.g. cgr.dev/<customer>/python) only carry the
+    # Enforce delivery signature — the build-time SPDX SBOM attestation that
+    # build-deps needs lives on chainguard-private. Rewrite the ref we run
+    # crane/cosign/enumerate against, but keep the customer-facing ref in
+    # every BuildEnvResult.image so output reflects what the user asked about.
+    # `result.source_image_ref` captures the rewrite for the per-image JSON.
+    SOURCE_ORG = "chainguard-private"
+    pairs: list[tuple[str, str]] = [
+        (
+            f"cgr.dev/{args.customer_org}/{name}:{args.tag}",  # display
+            f"cgr.dev/{SOURCE_ORG}/{name}:{args.tag}",          # source (where work runs)
+        )
+        for name in short_names
+    ]
+    if args.customer_org != SOURCE_ORG:
+        meta(
+            f"Note: verifying against the source org `{SOURCE_ORG}` "
+            f"(customer-delivery images don't carry the build-time SPDX "
+            f"attestation). Output keeps the `{args.customer_org}` refs."
+        )
+
+    # One cache + one lock across the whole batch — most images in an org pin
+    # the same stereo SHA, so this collapses ~N tree fetches to ~1-3.
+    tree_cache: dict[str, dict[str, str]] = {}
+    tree_lock = threading.Lock()
+
+    results: list["BuildEnvResult"] = []
+    workers = max(1, args.image_workers)
+    meta(
+        f"\nRunning build-deps across {len(pairs)} images "
+        f"({workers} in parallel; inner recipe workers: {args.max_workers}) ..."
+    )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_ref = {
+            pool.submit(
+                _build_deps_for_image,
+                source_ref,
+                github_token=token,
+                apk_token=apk_token,
+                apk_org=apk_org,
+                pol=pol,
+                args=args,
+                inner_workers=args.max_workers,
+                tree_cache=tree_cache,
+                tree_lock=tree_lock,
+                # Per-image internal progress lines would interleave wildly with
+                # 2+ parallel images; skip them and rely on the one-line
+                # completion message below instead.
+                meta=None,
+                display_image_ref=display_ref,
+            ): display_ref
+            for display_ref, source_ref in pairs
+        }
+        completed = 0
+        total = len(future_to_ref)
+        for fut in as_completed(future_to_ref):
+            result = fut.result()
+            completed += 1
+            short = result.image.rsplit("/", 1)[-1]
+            meta(f"  [{completed}/{total}] {short:<40} {result.status}")
+            results.append(result)
+
+    # Stable order in the summary regardless of completion order.
+    results.sort(key=lambda r: r.image)
+
+    # Output.
+    if args.format == "json":
+        payload = {
+            "customer_org": args.customer_org,
+            "tag": args.tag,
+            "total": len(results),
+            "status_counts": _build_deps_status_counts(results),
+            "results": [asdict(r) for r in results],
+        }
+        json.dump(payload, sys.stdout, indent=2)
+        print()
+    elif args.format == "csv":
+        _write_build_deps_fleet_csv_stream(results, sys.stdout)
+    else:
+        _print_build_deps_fleet_table(args.customer_org, args.tag, results, sys.stdout)
+
+    if args.csv_output:
+        with open(args.csv_output, "w", newline="", encoding="utf-8") as f:
+            _write_build_deps_fleet_csv_stream(results, f)
+        meta(f"Wrote per-(image,recipe,package) CSV to {args.csv_output}")
+
+    if args.output_dir:
+        _write_build_deps_output_dir(
+            Path(args.output_dir), results, args.customer_org, args.tag
+        )
+        meta(f"Wrote per-image detail to {args.output_dir}/")
+
+    meta(f"\nShared tree-cache populated {len(tree_cache)} distinct stereo SHA(s).")
+
+    # Fleet exit code: worst per-image exit code wins.
+    return max(
+        (_build_deps_exit_code(r.status, args.strict_closure) for r in results),
+        default=0,
+    )
 
 
 def main() -> None:

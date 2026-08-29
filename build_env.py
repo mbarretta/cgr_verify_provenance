@@ -126,11 +126,19 @@ class BuildEnvResult:
     closure_names: list[str] = field(default_factory=list)  # names only
     missing_recipes: list[str] = field(default_factory=list)  # "name@shortsha"
     pipeline_module_count: int = 0
-    status: str = "OK"  # OK | MISSING_RECIPES | DOCKER_FAILED | SBOM_EMPTY | CLOSURE_INCOMPLETE
+    # OK | MISSING_RECIPES | DOCKER_FAILED | SBOM_EMPTY | CLOSURE_INCOMPLETE
+    # Callers may also set ERROR (crane/cosign infra failure) or SKIPPED
+    # (image not present in the source org during a --customer-org batch).
+    status: str = "OK"
     error: str = ""
     # v2 additions: per-recipe apk closure errors and the private apk org used.
     errored_recipes: list[str] = field(default_factory=list)  # "name (pkg1, pkg2)"
     private_apk_org: str = ""
+    # Populated when the caller rewrote the image ref before verification (e.g.
+    # build-deps --customer-org rewrites cgr.dev/<customer>/foo to
+    # cgr.dev/chainguard-private/foo so cosign can match the build identity).
+    # `image` stays the user-facing ref; this records where the work actually ran.
+    source_image_ref: str = ""
 
 
 @dataclass
@@ -625,6 +633,8 @@ def enumerate_build_env(
     tmp_root: str | None = None,
     apk_token: str = "",
     private_apk_org: str = "",
+    tree_cache: dict[str, dict[str, str]] | None = None,
+    tree_lock: threading.Lock | None = None,
 ) -> BuildEnvResult:
     """Top-level orchestrator.
 
@@ -636,6 +646,11 @@ def enumerate_build_env(
 
     Raises BuildEnvError for hard infrastructure failures (docker unavailable,
     GitHub auth invalid, yq missing). Recipe-not-found is *not* an exception.
+
+    `tree_cache` / `tree_lock` may be supplied to share GitHub tree lookups
+    across multiple calls (e.g. an org-wide batch run where many images pin
+    the same stereo SHA). When omitted, a fresh per-call cache is used —
+    identical to the prior single-image behavior.
     """
     result = BuildEnvResult(image=image_ref, image_digest=image_digest)
     result.private_apk_org = private_apk_org
@@ -647,8 +662,10 @@ def enumerate_build_env(
         return result
     result.recipes = refs
 
-    tree_cache: dict[str, dict[str, str]] = {}
-    tree_lock = threading.Lock()
+    if tree_cache is None:
+        tree_cache = {}
+    if tree_lock is None:
+        tree_lock = threading.Lock()
     workers = max(1, max_workers)
 
     def _worker(r: RecipeRef) -> RecipeRef:
